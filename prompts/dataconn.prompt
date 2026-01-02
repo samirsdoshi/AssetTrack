@@ -1,0 +1,19 @@
+Dataconn sheet gets data from db. it uses below queries to get data and puts in columns as specified.
+assetbydate =SELECT * FROM `asset`.`assetbydate` where assetname not in ("Cash","Stock")
+used in = O1:U69
+
+cashheldatbydate = SELECT cashheldatbydate_0.heldat, cashheldatbydate_0.asofdate, cashheldatbydate_0.`sum(assetinvalloc.amount)`
+FROM cashheldatbydate cashheldatbydate_0
+used in = J1:L27
+
+
+heldatbydate SELECT heldatbydate_0.heldat, heldatbydate_0.asofdate, heldatbydate_0.`sum(assetinvalloc.amount)`
+FROM heldatbydate heldatbydate_0
+used in =F1:H27
+
+
+totalbyalloctypedate =SELECT totalbyalloctypedate_0.allocdesc, totalbyalloctypedate_0.asofdate, totalbyalloctypedate_0.`sum(assetinvalloc.amount)`
+FROM totalbyalloctypedate totalbyalloctypedate_0
+used in =A1:C17 
+
+create mode to refresh dataconn sheet using above queries.
