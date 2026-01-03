@@ -45,7 +45,14 @@ pip install -r requirements.txt
 echo "password=YourExcelPassword" > .env
 ```
 
-3. Ensure MySQL is running on port 3306 (use your existing startmysql.sh):
+3. (Optional) Set up Google Drive API for backup uploads:
+   - Go to [Google Cloud Console](https://console.cloud.google.com/)
+   - Create a new project or select existing one
+   - Enable Google Drive API
+   - Create OAuth 2.0 credentials (Desktop app)
+   - Download `credentials.json` to this directory
+
+4. Ensure MySQL is running on port 3306 (use your existing startmysql.sh):
 ```bash
 ./startmysql.sh
 ```
@@ -176,6 +183,82 @@ This operation:
 - Executes 4 predefined database queries
 - Populates the DataConn sheet with results from each query
 - Used to sync Excel with current database state
+
+### Refresh Connection Options
+
+The `--refresh-dataconn` option supports multiple database connection configurations and date parameters:
+
+**Default Local Connection:**
+```bash
+python process_assets.py --refresh-dataconn
+```
+Uses default values:
+- Host: localhost
+- Port: 3306
+- User: root
+- Password: sa123
+- Database: asset
+
+**With Current Date and Previous Date:**
+```bash
+python process_assets.py --refresh-dataconn --currdate 2025-12-31 --datetocompare 2025-12-24
+```
+
+This updates:
+- `wkdates.currdate` with the current date (2025-12-31)
+- `wkdates.datetocompare` with the comparison date (2025-12-24)
+- Used for comparing performance between two dates in Excel reports
+
+**Custom Host:**
+```bash
+python process_assets.py --refresh-dataconn --db-host 192.168.1.10
+```
+
+**Custom Port:**
+```bash
+python process_assets.py --refresh-dataconn --db-port 3307
+```
+
+**Custom User Credentials:**
+```bash
+python process_assets.py --refresh-dataconn --db-user myuser --db-password mypass
+```
+
+**Alternative Database:**
+```bash
+python process_assets.py --refresh-dataconn --db-name asset_backup
+```
+
+**Combined Options with Dates:**
+```bash
+python process_assets.py --refresh-dataconn --file Asset_clean.xls --currdate 2025-12-31 --datetocompare 2025-12-24
+```
+
+**Environment Variable Configuration:**
+Set database connection via environment variables (.env file):
+```
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=sa123
+DB_NAME=asset
+```
+
+Then run:
+```bash
+python process_assets.py --refresh-dataconn --currdate 2025-12-31 --datetocompare 2025-12-24
+```
+
+#### Date Parameters Details
+
+- `--currdate` - Current date for wkdates table and assetref cell N4 (YYYY-MM-DD format)
+  - Updates current/latest portfolio value
+  - Reflects today's or most recent data
+  
+- `--datetocompare` - Comparison date for wkdates table and assetref cell N3 (YYYY-MM-DD format)
+  - Previous date to compare against
+  - Used to calculate period-over-period changes
+  - Must have data in database for the specified date
 
 ## Excel File Format
 
@@ -310,6 +393,27 @@ Ensure Asset.xls is in the same directory or provide full path:
 ```bash
 python process_assets.py --file /path/to/Asset.xls
 ```
+
+## Backup to Google Drive
+
+Upload SQL backups and Excel file to Google Drive:
+```bash
+python upload_to_gdrive.py
+```
+
+This will:
+- Upload all `asset*.sql` files in the current directory
+- Upload `Asset.xlsx` file
+- Save to Google Drive folder: https://drive.google.com/drive/u/1/folders/1143-kZ1KCLy8yQsL8Dkms1mowIndLfRu
+
+**First-time setup:**
+1. Install Google Drive API dependencies: `pip install -r requirements.txt`
+2. Download `credentials.json` from Google Cloud Console (see Installation step 3)
+3. Run the script - it will open a browser for OAuth authentication
+4. Grant permissions - a `token.pickle` file will be saved for future runs
+
+**Subsequent runs:**
+Just run `python upload_to_gdrive.py` - authentication is cached in `token.pickle`
 
 ## Notes
 

@@ -6,3 +6,6 @@ __pycache__/
 .vscode/
 data/
 *sql
+credentials.json
+token.pickle
+backup/
