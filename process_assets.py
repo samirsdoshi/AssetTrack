@@ -220,18 +220,31 @@ class AssetProcessor:
         trp_accounts = ['TRPInv', 'TRPRollover', 'TRPRoth', 'TRPRps']
         results_df = results_df[~results_df['account_ticker'].str.startswith(tuple(f"{acc}_" for acc in trp_accounts))]
         
-        # Read Trow sheet columns N and O, and add to results
+        # Read Trow sheet and manually compute columns N and O from source columns
+        # Column N formula: =CONCAT(M,"_",C) - concatenates column M (account) and C (ticker)
+        # Column O formula: =I - market value
+        # Also read pre-formatted entries directly from N and O
         try:
             print("Reading Trow sheet data...")
             trow_df = self.decrypt_and_read_excel('Trow', header=None)
             
-            # Extract columns N (index 13) and O (index 14)
+            # First pass: Extract and compute values from columns C (ticker), I (amount), M (account)
+            # Skip header row (index 0)
+            added_count = 0
             for idx, row in trow_df.iterrows():
-                ticker = row.get(13)  # Column N
-                amount = row.get(14)  # Column O
+                if idx == 0:  # Skip header row
+                    continue
+                    
+                account = row.get(12)  # Column M (index 12)
+                ticker = row.get(2)    # Column C (index 2)
+                amount = row.get(8)    # Column I (index 8)
                 
-                # Skip if either is empty or amount is 0
-                if pd.isna(ticker) or pd.isna(amount) or ticker == '' or amount == 0:
+                # Skip if any required field is empty
+                if pd.isna(account) or pd.isna(ticker) or pd.isna(amount):
+                    continue
+                
+                # Skip if account or ticker is empty string
+                if str(account).strip() == '' or str(ticker).strip() == '':
                     continue
                 
                 # Clean up amount if it's a string
@@ -242,13 +255,82 @@ class AssetProcessor:
                     except:
                         continue
                 
+                # Skip if amount is 0
+                if amount == 0:
+                    continue
+                
+                # Construct account_ticker (equivalent to column N formula)
+                account_ticker = f"{account}_{ticker}"
+                
                 # Add to results
                 results_df = pd.concat([results_df, pd.DataFrame([{
-                    'account_ticker': str(ticker),
+                    'account_ticker': account_ticker,
                     'amount': amount
                 }])], ignore_index=True)
+                added_count += 1
             
-            print(f"Added {len(trow_df[trow_df[13].notna() & trow_df[14].notna()])} entries from Trow sheet")
+            # Second pass: Read pre-formatted entries from columns N and O
+            # This handles rows where N already has "Account_Ticker" format
+            # Need to evaluate formulas in column O by reading from data_only=False and calculating
+            from openpyxl import load_workbook
+            try:
+                wb_formulas = load_workbook(self.excel_file, data_only=False)
+                wb_data = load_workbook(self.excel_file, data_only=True)
+                ws_f = wb_formulas['Trow']
+                ws_d = wb_data['Trow']
+                
+                for row_idx in range(1, 100):
+                    n_val = ws_d[f'N{row_idx}'].value
+                    o_formula = ws_f[f'O{row_idx}'].value
+                    
+                    # Skip if N is empty or doesn't contain "_"
+                    if not n_val or '_' not in str(n_val):
+                        continue
+                    
+                    # Try to evaluate formula in O
+                    amount = None
+                    if o_formula and str(o_formula).startswith('='):
+                        # Formula exists but not evaluated - try to manually evaluate simple cases
+                        formula_str = str(o_formula)[1:]  # Remove '='
+                        
+                        # Handle simple cell references like "A45"
+                        if formula_str.startswith('A') and formula_str[1:].isdigit():
+                            ref_row = int(formula_str[1:])
+                            amount = ws_d[f'A{ref_row}'].value
+                        # Handle addition like "A37+A41"
+                        elif '+' in formula_str:
+                            parts = formula_str.split('+')
+                            total = 0
+                            for part in parts:
+                                part = part.strip()
+                                if part.startswith('A') and part[1:].isdigit():
+                                    ref_row = int(part[1:])
+                                    val = ws_d[f'A{ref_row}'].value
+                                    if val:
+                                        total += float(val)
+                            amount = total if total > 0 else None
+                    elif o_formula:
+                        # Direct value
+                        amount = o_formula
+                    
+                    if amount and amount != 0:
+                        # Clean up amount if needed
+                        if isinstance(amount, str):
+                            amount = amount.replace('$', '').replace(',', '')
+                            try:
+                                amount = float(amount)
+                            except:
+                                continue
+                        
+                        results_df = pd.concat([results_df, pd.DataFrame([{
+                            'account_ticker': str(n_val),
+                            'amount': amount
+                        }])], ignore_index=True)
+                        added_count += 1
+            except Exception as e:
+                print(f"Could not read pre-formatted N/O columns: {e}")
+            
+            print(f"Added {added_count} entries from Trow sheet")
         except Exception as e:
             print(f"Warning: Could not read Trow sheet: {e}")
         
@@ -301,30 +383,90 @@ class AssetProcessor:
             
             ws = wb[sheet_name]
             
-            # Clear columns K:O (rows 1-2000)
+            # IMPORTANT: Read stock account data from N, O, P BEFORE clearing columns
+            # Need to evaluate formulas in column P, so load both formula and data versions
+            wb_data = load_workbook(self.excel_file, data_only=True)
+            ws_data = wb_data[sheet_name]
+            
+            stock_account_entries = []
+            print("\nReading stock account entries from columns N, O, P...")
+            for row_idx in range(1, 1000):
+                account = ws[f'N{row_idx}'].value
+                ticker = ws[f'O{row_idx}'].value
+                amount_formula = ws[f'P{row_idx}'].value
+                amount_value = ws_data[f'P{row_idx}'].value
+                
+                # Skip if account or ticker is empty or if ticker is "Total"
+                if not account or not ticker or ticker == 'Total':
+                    continue
+                
+                # Get amount - prefer calculated value, fallback to formula evaluation
+                amount = amount_value
+                
+                # If amount is still None/empty but there's a formula, try to evaluate it
+                if not amount and amount_formula and str(amount_formula).startswith('='):
+                    formula_str = str(amount_formula)[1:]  # Remove '='
+                    # Handle simple cases like "P3-P2"
+                    if '-' in formula_str:
+                        parts = formula_str.split('-')
+                        if len(parts) == 2:
+                            val1 = val2 = 0
+                            p1 = parts[0].strip()
+                            p2 = parts[1].strip()
+                            if p1.startswith('P') and p1[1:].isdigit():
+                                val1 = ws_data[p1].value or 0
+                            if p2.startswith('P') and p2[1:].isdigit():
+                                val2 = ws_data[p2].value or 0
+                            amount = val1 - val2
+                
+                # Skip if amount is still empty or 0
+                if not amount or amount == 0:
+                    continue
+                
+                # Store the entry
+                stock_account_entries.append({
+                    'account': account,
+                    'ticker': ticker,
+                    'amount': amount
+                })
+            
+            print(f"Found {len(stock_account_entries)} stock account entries")
+            
+            # Clear ONLY columns K and L (rows 1-2000) - DO NOT touch N, O, P
             for row in range(1, 2001):
                 ws[f'K{row}'].value = None
                 ws[f'L{row}'].value = None
-                ws[f'N{row}'].value = None
-                ws[f'O{row}'].value = None
             
-            # Write results to columns K and L
+            # Write fund results to columns K and L
             j = 1
             for _, row in results_df.iterrows():
                 ws[f'K{j}'].value = row['account_ticker']
                 ws[f'L{j}'].value = row['amount']
                 j += 1
             
-            # Write summary to columns N and O (starting at row 8)
-            k = 8
-            for _, row in summary_df.iterrows():
-                ws[f'N{k}'].value = row['account']
-                ws[f'O{k}'].value = row['total']
-                k += 1
+            # Append stock account entries (read earlier from N, O, P) to K and L
+            print(f"\nAppending {len(stock_account_entries)} stock account entries to columns K and L...")
+            stock_appended = 0
+            
+            for entry in stock_account_entries:
+                account = entry['account']
+                ticker = entry['ticker']
+                amount = entry['amount']
+                
+                # Create account_ticker format: Account_Ticker
+                account_ticker = f"{account}_{ticker}"
+                
+                # Append to columns K and L
+                ws[f'K{j}'].value = account_ticker
+                ws[f'L{j}'].value = amount
+                j += 1
+                stock_appended += 1
+            
+            print(f"Appended {stock_appended} stock account entries")
             
             # Save the workbook
             wb.save(self.excel_file)
-            print(f"Results written to {self.excel_file} in columns K, L, N, O")
+            print(f"Results written to {self.excel_file} in columns K and L")
             
         except Exception as e:
             print(f"Warning: Could not write back to Excel file: {e}")
@@ -560,7 +702,21 @@ class AssetProcessor:
         """
         try:
             # Try to read directly first (unprotected file)
-            df = pd.read_excel(self.excel_file, sheet_name=sheet_name, header=header, engine='openpyxl')
+            # Use openpyxl with data_only=True to read calculated formula values
+            from openpyxl import load_workbook as openpyxl_load
+            wb = openpyxl_load(self.excel_file, data_only=True)
+            ws = wb[sheet_name]
+            
+            # Convert to DataFrame manually
+            data = []
+            for row in ws.iter_rows(values_only=True):
+                data.append(row)
+            
+            if header is not None and len(data) > header:
+                df = pd.DataFrame(data[header+1:], columns=data[header])
+            else:
+                df = pd.DataFrame(data)
+            
             return df
         except Exception as e:
             # If failed, try with password decryption
@@ -590,7 +746,7 @@ class AssetProcessor:
                     
                     # Use openpyxl to load cleaned file
                     from openpyxl import load_workbook as openpyxl_load
-                    wb = openpyxl_load(cleaned, data_only=False)
+                    wb = openpyxl_load(cleaned, data_only=True)
                     ws = wb[sheet_name]
                     
                     # Convert to DataFrame manually
@@ -613,32 +769,53 @@ class AssetProcessor:
                 print("No password found in .env file")
                 raise
     
-    def read_asset_reference_sheet(self, sheet_name: str = 'assetref') -> pd.DataFrame:
+    def read_asset_reference_sheet(self, sheet_name: str = 'fullview') -> pd.DataFrame:
         """
-        Read the asset reference sheet from Excel
+        Read asset data directly from fullview sheet columns K and L
+        Column K contains account_ticker (e.g., "FidelityInv_FXAIX", "Etrade_Cash")
+        Column L contains amount
         
         Args:
-            sheet_name: Name of the sheet to read
+            sheet_name: Name of the sheet to read (default: fullview)
             
         Returns:
-            DataFrame with asset data
+            DataFrame with columns: Ticker (account_ticker), Amount, HeldAt
         """
         try:
-            # Read without header since assetref doesn't have column names
+            # Read fullview sheet without header
             df = self.decrypt_and_read_excel(sheet_name, header=None)
             
-            # Assign column names based on position
-            # Column A=0: Ticker, C=2: Quantity, E=4: Amount, J=9: HeldAt
-            df.columns = [f'Col{i}' for i in range(len(df.columns))]
-            df = df.rename(columns={
-                'Col0': 'Ticker',
-                'Col2': 'Quantity', 
-                'Col4': 'Amount',
-                'Col9': 'HeldAt'
-            })
+            # Extract data from columns K (index 10) and L (index 11)
+            all_data = []
             
-            print(f"Successfully read sheet '{sheet_name}' from {self.excel_file}")
-            return df
+            for idx, row in df.iterrows():
+                # Get values from columns K and L
+                account_ticker_k = row.get(10)  # Column K
+                amount_l = row.get(11)  # Column L
+                
+                if pd.notna(account_ticker_k) and pd.notna(amount_l) and amount_l != 0:
+                    # Clean up amount
+                    if isinstance(amount_l, str):
+                        amount_l = amount_l.replace('$', '').replace(',', '')
+                        try:
+                            amount_l = float(amount_l)
+                        except:
+                            continue
+                    
+                    # Split account_ticker to get account and ticker
+                    account_ticker_str = str(account_ticker_k)
+                    if '_' in account_ticker_str:
+                        held_at, ticker = account_ticker_str.split('_', 1)
+                        all_data.append({
+                            'Ticker': ticker,
+                            'Amount': amount_l,
+                            'HeldAt': held_at
+                        })
+            
+            result_df = pd.DataFrame(all_data)
+            
+            print(f"Successfully read {len(result_df)} entries from '{sheet_name}' columns K and L")
+            return result_df
         except FileNotFoundError:
             print(f"Error: File '{self.excel_file}' not found")
             sys.exit(1)
@@ -781,6 +958,15 @@ class AssetProcessor:
                 ticker = filter_ticker(ticker)
                 if not ticker:
                     continue
+                
+                # Apply fund mapping (e.g., VMRXX -> VMMXX)
+                fund_mapping = {
+                    'VMRXX': 'VMMXX'
+                }
+                if ticker in fund_mapping:
+                    original_ticker = ticker
+                    ticker = fund_mapping[ticker]
+                    print(f"Mapped {original_ticker} -> {ticker}")
                 
                 # Get held at location
                 held_at = row.get(held_at_column, row.get('HeldAt', ''))
@@ -1115,7 +1301,7 @@ class AssetProcessor:
         print("Fix Complete!")
         print("=" * 60)
     
-    def run_full_process(self, as_of_date: datetime, sheet_name: str = 'assetref', 
+    def run_full_process(self, as_of_date: datetime, sheet_name: str = 'fullview', 
                         delete_existing: bool = True, calculate_gains: bool = False):
         """
         Run the full asset processing workflow
@@ -1163,8 +1349,8 @@ def main():
     parser = argparse.ArgumentParser(description='Process Asset.xls file and update database')
     parser.add_argument('--file', '-f', default='Asset.xls', 
                        help='Path to Excel file (default: Asset.xls)')
-    parser.add_argument('--sheet', '-s', default='assetref',
-                       help='Sheet name to process (default: assetref)')
+    parser.add_argument('--sheet', '-s', default='fullview',
+                       help='Sheet name to process (default: fullview)')
     parser.add_argument('--date', '-d', 
                        help='As-of date in YYYY-MM-DD format (default: today)')
     parser.add_argument('--no-delete', action='store_true',
