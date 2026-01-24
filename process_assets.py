@@ -85,13 +85,55 @@ class AssetProcessor:
             print(f"Error converting file: {e}")
             raise
     
-    def normalize_full_view(self, sheet_name: str = 'fullview', output_file: str = None) -> pd.DataFrame:
+    def update_assetalloc_dates(self, prevdate: str = None, currdate: str = None):
+        """Update Assetalloc sheet B1 (prevdate) and C1 (currdate) with direct values"""
+        if not prevdate and not currdate:
+            return
+        
+        print(f"\nUpdating Assetalloc sheet dates...")
+        try:
+            from openpyxl import load_workbook
+            import msoffcrypto
+            import io
+            
+            # Load workbook
+            wb = load_workbook(self.excel_file, data_only=False)
+            
+            # Check available sheet names (case-insensitive search)
+            sheet_name = None
+            for name in wb.sheetnames:
+                if name.lower() == 'assetalloc':
+                    sheet_name = name
+                    break
+            
+            if not sheet_name:
+                print(f"  Warning: Assetalloc sheet not found in {self.excel_file}")
+                print(f"  Available sheets: {', '.join(wb.sheetnames)}")
+                return
+            
+            ws = wb[sheet_name]
+            # Set direct values (this will replace any formulas)
+            if prevdate:
+                ws['B1'].value = prevdate
+                print(f"  Set B1 (prevdate) = {prevdate}")
+            if currdate:
+                ws['C1'].value = currdate
+                print(f"  Set C1 (currdate) = {currdate}")
+            
+            wb.save(self.excel_file)
+            print(f"  Assetalloc sheet updated successfully")
+        except Exception as e:
+            print(f"  Error: Could not update Assetalloc dates: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def normalize_full_view(self, sheet_name: str = 'fidfullview', output_file: str = None) -> pd.DataFrame:
         """
-        Normalize and aggregate fullview data by account
+        Normalize and aggregate fidfullview data by account
         Converted from VBA normalizefullview() function
         
         Args:
-            sheet_name: Name of the sheet to process (default: 'fullview')
+            sheet_name: Name of the sheet to process (default: 'fidfullview')
             output_file: Optional output Excel file to save results
             
         Returns:
@@ -99,126 +141,87 @@ class AssetProcessor:
         """
         print(f"Normalizing full view from sheet '{sheet_name}'...")
         
-        # Read the fullview sheet (no header for fullview)
-        df = self.decrypt_and_read_excel(sheet_name, header=None)
+        # Read the fidfullview sheet (has header row)
+        df = self.decrypt_and_read_excel(sheet_name, header=0)
+        
+        # Account mapping based on Column B values
+        account_mapping = {
+            'Individual - TOD': 'FidelityInv',
+            'Rollover IRA': 'FidelityIRA',
+            'Samir S Doshi - Brokerage Account - 10498558': 'Vanguard',
+            'Samir S Doshi - Rollover IRA': 'Vanguard IRA'
+        }
         
         account_data = {}  # Dictionary to store aggregated amounts by account
-        results = []  # List to store individual ticker results
+        ticker_data = {}  # Dictionary to aggregate by account_ticker combination
         
-        curr_account = ""
-        old_account = ""
+        # Process each row
+        for idx, row in df.iterrows():
+            # Get values from named columns (B='Account Name', C='Symbol', H='Current Value')
+            account_name = row.get('Account Name') or row.iloc[1] if len(row) > 1 else None
+            symbol = row.get('Symbol') or row.iloc[2] if len(row) > 2 else None
+            value = row.get('Current Value') or row.iloc[7] if len(row) > 7 else None
+            
+            # Skip if any required field is missing or empty
+            if pd.isna(account_name) or pd.isna(symbol) or pd.isna(value):
+                continue
+            
+            account_name = str(account_name).strip()
+            symbol = str(symbol).strip()
+            
+            if account_name == '' or symbol == '':
+                continue
+            
+            # Map specific symbols to Cash
+            if symbol in ['FDRXX**', 'FCASH**', 'FDRXX', 'FCASH', 'Pending activity', 'VMRXX', 'VMFXX', 'VMRXX**', 'VMFXX**']:
+                symbol = 'Cash'
+            
+            # Clean up value if it's a string
+            if isinstance(value, str):
+                value = value.replace('$', '').replace(',', '')
+                try:
+                    value = float(value)
+                except:
+                    continue
+            
+            # Skip zero values
+            if value == 0:
+                continue
+            
+            # Map account name to prefix
+            account_prefix = account_mapping.get(account_name, None)
+            
+            # Skip if account not in mapping (will be handled by Trow sheet)
+            if not account_prefix:
+                continue
+            
+            # Create account_ticker key
+            account_ticker = f"{account_prefix}_{symbol}"
+            
+            # Aggregate by account_ticker (sum duplicates)
+            if account_ticker not in ticker_data:
+                ticker_data[account_ticker] = 0
+            ticker_data[account_ticker] += value
+            
+            # Aggregate by account
+            if account_prefix not in account_data:
+                account_data[account_prefix] = 0
+            account_data[account_prefix] += value
         
-        i = 0
-        while i < len(df):
-            # Check if we've reached the end
-            if pd.isna(df.iloc[i, 0]) or df.iloc[i, 0] == "":
-                break
-            
-            account = str(df.iloc[i, 0])
-            
-            # Get fund name from next row if available
-            fund = ""
-            if i + 1 < len(df):
-                fund = str(df.iloc[i + 1, 0]).lower() if not pd.isna(df.iloc[i + 1, 0]) else ""
-            
-            curr_account = ""
-            
-            # Categorize accounts based on patterns
-            if "CollegeAdv" in account:
-                curr_account = "CollegeAdv"
-            elif "- Individual" in account and "rowe" in fund and "price" in fund:
-                curr_account = "TRPInv"
-            elif "Rollover IRA" in account and "rowe" in fund and "price" in fund:
-                curr_account = "TRPRollover"
-            elif "Roth IRA" in account and "rowe" in fund and "price" in fund:
-                curr_account = "TRPRoth"
-            elif "Traditional IRA" in account and "rowe" in fund and "price" in fund:
-                curr_account = "TRPRollover"  # Sangeeta's account
-            elif "GAPSHARE 401(K) PLAN" in account:
-                curr_account = "TRPRps"
-            elif "Individual - TOD" in account:
-                curr_account = "FidelityInv"
-            elif "Samir S Doshi - Rollover IRA" in account:
-                curr_account = "Vanguard IRA"
-            elif not curr_account and "Rollover IRA" in account:
-                curr_account = "FidelityIRA"
-            elif "Brokerage Account - 10498558" in account:
-                curr_account = "Vanguard"
-            elif "Vanguard Investments - Samir S Doshi" in account:
-                curr_account = "Vanguard"
-            
-            # If no current account but we have an old account, this is a fund/ticker row
-            if not curr_account and old_account:
-                fund = account  # This row is actually the fund/ticker
-                ticker = df.iloc[i, 1] if not pd.isna(df.iloc[i, 1]) else ""
-                amount = df.iloc[i, 5] if not pd.isna(df.iloc[i, 5]) else 0  # Column F (index 5)
-                
-                # Clean up amount if it's a string
-                if isinstance(amount, str):
-                    amount = amount.replace('$', '').replace(',', '')
-                    try:
-                        amount = float(amount)
-                    except:
-                        amount = 0
-                
-                # Store result
-                results.append({
-                    'account_ticker': f"{old_account}_{ticker}",
-                    'amount': amount
-                })
-                
-                # Aggregate by account
-                if old_account not in account_data:
-                    account_data[old_account] = 0
-                account_data[old_account] += amount
-            else:
-                old_account = curr_account
-            
-            i += 1
+        # Convert ticker_data dictionary to list of results
+        results = []
+        for account_ticker, amount in ticker_data.items():
+            results.append({
+                'account_ticker': account_ticker,
+                'amount': amount
+            })
         
-        # Create results DataFrame and sort by account_ticker
+        # Create results DataFrame
         results_df = pd.DataFrame(results)
         
-        # Aggregate _Stock entries: sum all <Account>_Stock_* into <Account>_Stock
-        aggregated_results = []
-        stock_aggregates = {}
-        
-        for _, row in results_df.iterrows():
-            ticker = row['account_ticker']
-            amount = row['amount']
-            
-            # Check if this is a stock entry with additional ticker info
-            if '_Stock' in ticker:
-                # Extract the account_Stock prefix (everything up to and including _Stock)
-                parts = ticker.split('_Stock')
-                if len(parts) >= 2:
-                    base_ticker = parts[0] + '_Stock'
-                    # Aggregate under the base ticker
-                    if base_ticker not in stock_aggregates:
-                        stock_aggregates[base_ticker] = 0
-                    stock_aggregates[base_ticker] += amount
-                else:
-                    # Already in base form
-                    if ticker not in stock_aggregates:
-                        stock_aggregates[ticker] = 0
-                    stock_aggregates[ticker] += amount
-            else:
-                # Non-stock entry, keep as is
-                aggregated_results.append({'account_ticker': ticker, 'amount': amount})
-        
-        # Add aggregated stock entries
-        for ticker, total_amount in stock_aggregates.items():
-            aggregated_results.append({'account_ticker': ticker, 'amount': total_amount})
-        
-        # Create new DataFrame with aggregated results and sort
-        results_df = pd.DataFrame(aggregated_results)
-        
-        # Remove entries with 0 value
-        results_df = results_df[results_df['amount'] != 0]
-        
-        # Remove TRP accounts (will be replaced with Trow sheet data)
-        trp_accounts = ['TRPInv', 'TRPRollover', 'TRPRoth', 'TRPRps']
-        results_df = results_df[~results_df['account_ticker'].str.startswith(tuple(f"{acc}_" for acc in trp_accounts))]
+        # Remove entries with 0 value (shouldn't happen but safety check)
+        if len(results_df) > 0:
+            results_df = results_df[results_df['amount'] != 0]
         
         # Read Trow sheet and manually compute columns N and O from source columns
         # Column N formula: =CONCAT(M,"_",C) - concatenates column M (account) and C (ticker)
@@ -349,6 +352,7 @@ class AssetProcessor:
             print(f"  {row['account']}: ${row['total']:,.2f}")
         
         # Write results back to the fullview sheet (columns K, L, N, O)
+        # Note: We read from fldfullview sheet but write results to fullview sheet for compatibility
         try:
             from openpyxl import load_workbook
             from zipfile import ZipFile
@@ -381,12 +385,13 @@ class AssetProcessor:
             else:
                 wb = load_workbook(self.excel_file, data_only=False)
             
-            ws = wb[sheet_name]
+            # Always write results to 'fullview' sheet (not the source sheet)
+            ws = wb['fullview']
             
             # IMPORTANT: Read stock account data from N, O, P BEFORE clearing columns
             # Need to evaluate formulas in column P, so load both formula and data versions
             wb_data = load_workbook(self.excel_file, data_only=True)
-            ws_data = wb_data[sheet_name]
+            ws_data = wb_data['fullview']
             
             stock_account_entries = []
             print("\nReading stock account entries from columns N, O, P...")
@@ -480,214 +485,7 @@ class AssetProcessor:
             print(f"\nResults also saved to {output_file}")
         
         return results_df, summary_df
-    
-    def update_asset_ref_from_fullview(self):
-        """
-        Update assetref sheet from fullview normalized data
-        Matches Column K (Account_Fund) with Column J (Account) and Column A (Fund)
-        Updates Column E with values from Column L in fullview
-        """
-        print("Updating assetref from fullview...")
-        
-        try:
-            # Read fullview sheet normalized data (columns K and L)
-            fullview_df = self.decrypt_and_read_excel('fullview', header=None)
-            
-            # Read assetref sheet
-            assetref_df = self.decrypt_and_read_excel('assetref', header=0)
-            
-            from openpyxl import load_workbook
-            
-            # Load workbook for writing
-            if self.excel_password and not self.excel_file.endswith('.xlsx'):
-                try:
-                    decrypted = io.BytesIO()
-                    with open(self.excel_file, 'rb') as f:
-                        office_file = msoffcrypto.OfficeFile(f)
-                        office_file.load_key(password=self.excel_password)
-                        office_file.decrypt(decrypted)
-                    decrypted.seek(0)
-                    wb = load_workbook(decrypted)
-                except:
-                    wb = load_workbook(self.excel_file)
-            else:
-                wb = load_workbook(self.excel_file)
-            
-            ws = wb['assetref']
-            
-            # Extract fullview data from columns K (10) and L (11)
-            fullview_data = {}
-            
-            # Fund mapping dictionary - map alternative fund names
-            fund_mapping = {
-                'VMRXX': 'VMMXX',  # Vanguard fund mapping
-            }
-            
-            for idx, row in fullview_df.iterrows():
-                account_fund = row.get(10)  # Column K
-                amount = row.get(11)  # Column L
-                
-                if pd.isna(account_fund) or account_fund == '':
-                    continue
-                
-                # Parse account_fund into account and fund
-                account_fund_str = str(account_fund)
-                if '_' in account_fund_str:
-                    parts = account_fund_str.split('_', 1)  # Split on first underscore
-                    account = parts[0]
-                    fund = parts[1]
-                    
-                    # Store in dictionary with (account, fund) as key
-                    fullview_data[(account, fund)] = amount
-                    
-                    # Also store mapped version if applicable
-                    if fund in fund_mapping:
-                        mapped_fund = fund_mapping[fund]
-                        fullview_data[(account, mapped_fund)] = amount
-            
-            print(f"Found {len(fullview_data)} entries in fullview columns K and L")
-            
-            # Track matches and mismatches
-            matched_count = 0
-            updated_count = 0
-            unmatched = []
-            account_totals = {}  # Track totals per account
-            
-            # Iterate through assetref rows (starting from row 2 in Excel, index 1 in 0-based)
-            for idx in range(1, ws.max_row + 1):
-                # Read Column A (Ticker/Fund) and Column J (HeldAt/Account)
-                fund_cell = ws[f'A{idx}'].value
-                account_cell = ws[f'J{idx}'].value
-                
-                if not fund_cell or fund_cell == '':
-                    continue
-                
-                fund = str(fund_cell).strip()
-                
-                # Stop processing if we encounter Etrade or ENDOFPORTFOLIO
-                if fund == 'ENDOFPORTFOLIO' or fund == 'Etrade':
-                    break
-                
-                account = str(account_cell).strip() if account_cell else ''
-                
-                if not account:
-                    continue
-                
-                # Check if this is a Total row
-                if fund.endswith(' Total') or 'Total' in fund:
-                    # This is a total row - we'll update it later
-                    continue
-                
-                # Look up in fullview_data
-                if (account, fund) in fullview_data:
-                    amount = fullview_data[(account, fund)]
-                    # Update Column E
-                    ws[f'E{idx}'].value = amount
-                    matched_count += 1
-                    updated_count += 1
-                    
-                    # Add to account total
-                    if account not in account_totals:
-                        account_totals[account] = 0
-                    account_totals[account] += float(amount) if amount else 0
-                else:
-                    # Check current value in column E
-                    current_value = ws[f'E{idx}'].value
-                    if current_value and current_value != 0:
-                        unmatched.append({
-                            'row': idx,
-                            'account': account,
-                            'fund': fund,
-                            'current_value': current_value
-                        })
-                        # Add to account total
-                        if account not in account_totals:
-                            account_totals[account] = 0
-                        try:
-                            account_totals[account] += float(current_value)
-                        except:
-                            pass
-            
-            # Update existing total rows and track which accounts have totals
-            print("\nUpdating account totals in column B...")
-            accounts_with_totals = set()
-            last_row_per_account = {}  # Track last fund row for each account
-            
-            # First pass: update existing totals and track last rows
-            for idx in range(1, ws.max_row + 1):
-                fund_cell = ws[f'A{idx}'].value
-                account_cell = ws[f'J{idx}'].value
-                
-                if not fund_cell:
-                    continue
-                
-                fund = str(fund_cell).strip()
-                
-                if fund == 'ENDOFPORTFOLIO' or fund == 'Etrade':
-                    break
-                
-                account = str(account_cell).strip() if account_cell else ''
-                
-                # Check if this is a Total row
-                if ' Total' in fund:
-                    # Extract account name from "<Account> Total"
-                    total_account = fund.replace(' Total', '').strip()
-                    # Also check column J for account
-                    if account_cell:
-                        total_account = str(account_cell).strip()
-                    
-                    accounts_with_totals.add(total_account)
-                    
-                    if total_account in account_totals:
-                        total = account_totals[total_account]
-                        ws[f'B{idx}'].value = total
-                        print(f"  {total_account} Total: ${total:,.2f} (Row {idx})")
-                    else:
-                        print(f"  Warning: No total calculated for {total_account}")
-                elif account and not fund.endswith(' Total'):
-                    # Track last row for each account
-                    last_row_per_account[account] = idx
-            
-            # Second pass: add missing total rows
-            accounts_needing_totals = set(account_totals.keys()) - accounts_with_totals
-            if accounts_needing_totals:
-                print("\nAdding missing total rows...")
-                for account in sorted(accounts_needing_totals):
-                    if account in last_row_per_account:
-                        # Insert after the last fund row for this account
-                        insert_row = last_row_per_account[account] + 1
-                        ws.insert_rows(insert_row)
-                        
-                        # Set the total row data
-                        ws[f'A{insert_row}'].value = f"{account} Total"
-                        ws[f'B{insert_row}'].value = account_totals[account]
-                        ws[f'J{insert_row}'].value = account
-                        
-                        print(f"  Added {account} Total: ${account_totals[account]:,.2f} (Row {insert_row})")
-                        
-                        # Update last_row_per_account for subsequent accounts
-                        for acc, row in last_row_per_account.items():
-                            if row >= insert_row:
-                                last_row_per_account[acc] += 1
-            
-            # Save workbook
-            wb.save(self.excel_file)
-            
-            print(f"\n=== Update Summary ===")
-            print(f"Matched and updated: {updated_count} entries")
-            print(f"Unmatched in assetref: {len(unmatched)} entries")
-            
-            if unmatched:
-                print("\nUnmatched entries (in assetref but not in fullview):")
-                for entry in unmatched:
-                    print(f"  Row {entry['row']}: {entry['account']}_{entry['fund']} = ${entry['current_value']}")
-            
-            print(f"\nAssetref sheet updated successfully!")
-            
-        except Exception as e:
-            print(f"Error updating assetref: {e}")
-            import traceback
-            traceback.print_exc()
+
     
     def decrypt_and_read_excel(self, sheet_name: str, header=0) -> pd.DataFrame:
         """
@@ -705,6 +503,12 @@ class AssetProcessor:
             # Use openpyxl with data_only=True to read calculated formula values
             from openpyxl import load_workbook as openpyxl_load
             wb = openpyxl_load(self.excel_file, data_only=True)
+            
+            # Check if sheet exists
+            if sheet_name not in wb.sheetnames:
+                available_sheets = ', '.join(wb.sheetnames)
+                raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {available_sheets}")
+            
             ws = wb[sheet_name]
             
             # Convert to DataFrame manually
@@ -836,6 +640,7 @@ class AssetProcessor:
         
         processed_count = 0
         error_count = 0
+        error_details = []  # Track detailed error information
         
         # Assuming columns: Ticker (A), Symbol (B), Amount (E), HeldAt (J)
         # Adjust column names based on actual Excel structure
@@ -937,6 +742,7 @@ class AssetProcessor:
                             if not results:
                                 print(f"Warning: Asset not found for ticker Stock")
                                 error_count += 1
+                                error_details.append(f"Asset not found: Stock (for {held_at})")
                             else:
                                 asset_id = results[0]['assetid']
                                 print(f"Processing: Stock - ${stock_amount:,.2f} at {held_at}")
@@ -1004,6 +810,7 @@ class AssetProcessor:
                 if not results:
                     print(f"Warning: Asset not found for ticker {ticker}")
                     error_count += 1
+                    error_details.append(f"Asset not found: {ticker}")
                     continue
                 
                 asset_id = results[0]['assetid']
@@ -1016,6 +823,7 @@ class AssetProcessor:
             except Exception as e:
                 print(f"Error processing row {index}: {e}")
                 error_count += 1
+                error_details.append(f"Row {index}: {e}")
                 continue
         
         self.db.close_db()
@@ -1023,6 +831,208 @@ class AssetProcessor:
         print(f"\n=== Processing Complete ===")
         print(f"Processed: {processed_count} assets")
         print(f"Errors: {error_count}")
+        
+        if error_count > 0 and error_details:
+            print(f"\nError details:")
+            for error in error_details:
+                print(f"  - {error}")
+    
+    def compare_dates_report(self, currdate: datetime, datetocompare: datetime, threshold_percent: float = 5.0, show_all: bool = False):
+        """
+        Compare asset values between two dates and report significant changes
+        
+        Args:
+            currdate: Current date to compare
+            datetocompare: Previous date to compare against
+            threshold_percent: Minimum percentage change to report (default: 5%)
+            show_all: If True, show all changes regardless of threshold (default: False)
+        """
+        print(f"\n{'='*60}")
+        print(f"Significant Changes Report")
+        print(f"{'='*60}")
+        print(f"Comparing: {datetocompare.strftime('%Y-%m-%d')} vs {currdate.strftime('%Y-%m-%d')}")
+        if show_all:
+            print(f"Showing: ALL changes\n")
+        else:
+            print(f"Threshold: {threshold_percent}% change or more\n")
+        
+        self.db.open_db()
+        
+        # Query to get asset values by account and ticker for both dates
+        query = """
+            SELECT 
+                ai.asofdate,
+                ai.heldat as account,
+                a.ticker,
+                SUM(aia.amount) as total_amount
+            FROM assetinv ai
+            JOIN assetinvalloc aia ON ai.assetinvid = aia.assetinvid
+            JOIN asset a ON ai.assetid = a.assetid
+            WHERE ai.asofdate IN (%s, %s)
+            GROUP BY ai.asofdate, ai.heldat, a.ticker
+            ORDER BY ai.heldat, a.ticker, ai.asofdate
+        """
+        
+        results = self.db.execute_query(query, 
+            (datetocompare.strftime('%Y-%m-%d'), currdate.strftime('%Y-%m-%d')))
+        
+        # Organize data by account_ticker and also track account totals
+        data = {}
+        account_totals = {}
+        
+        for row in results:
+            date = row['asofdate']
+            account = row['account']
+            ticker = row['ticker']
+            amount = float(row['total_amount'])
+            
+            key = f"{account}_{ticker}"
+            if key not in data:
+                data[key] = {}
+            data[key][date] = amount
+            
+            # Track account totals
+            if account not in account_totals:
+                account_totals[account] = {}
+            if date not in account_totals[account]:
+                account_totals[account][date] = 0
+            account_totals[account][date] += amount
+        
+        # Calculate changes
+        changes = []
+        # Convert to date objects for comparison
+        prev_date = datetocompare.date() if hasattr(datetocompare, 'date') else datetocompare
+        curr_date = currdate.date() if hasattr(currdate, 'date') else currdate
+        
+        for key, dates in data.items():
+            # dates dict has date/datetime keys from DB - try both formats
+            prev_amount = 0
+            curr_amount = 0
+            for date_key, amount in dates.items():
+                # Convert date_key to date for comparison
+                dk = date_key.date() if hasattr(date_key, 'date') else date_key
+                if dk == prev_date:
+                    prev_amount = amount
+                if dk == curr_date:
+                    curr_amount = amount
+            
+            account_name = key.split('_')[0]  # Extract account name from key
+            
+            if prev_amount == 0 and curr_amount > 0:
+                # New position
+                changes.append({
+                    'key': key,
+                    'account': account_name,
+                    'prev': prev_amount,
+                    'curr': curr_amount,
+                    'change': curr_amount,
+                    'pct_change': 100.0,
+                    'type': 'NEW'
+                })
+            elif prev_amount > 0 and curr_amount == 0:
+                # Closed position
+                changes.append({
+                    'key': key,
+                    'account': account_name,
+                    'prev': prev_amount,
+                    'curr': curr_amount,
+                    'change': -prev_amount,
+                    'pct_change': -100.0,
+                    'type': 'CLOSED'
+                })
+            elif prev_amount > 0:
+                # Changed position
+                change_amount = curr_amount - prev_amount
+                pct_change = (change_amount / prev_amount) * 100
+                
+                # Add to list if show_all or if above threshold
+                if show_all or abs(pct_change) >= threshold_percent:
+                    changes.append({
+                        'key': key,
+                        'account': account_name,
+                        'prev': prev_amount,
+                        'curr': curr_amount,
+                        'change': change_amount,
+                        'pct_change': pct_change,
+                        'type': 'CHANGE'
+                    })
+        
+        # Sort by account first, then by absolute percentage change (descending)
+        changes.sort(key=lambda x: (x['account'], -abs(x['pct_change'])))
+        
+        # Calculate account totals and changes
+        account_summary = {}
+        for account, dates in account_totals.items():
+            prev_total = 0
+            curr_total = 0
+            for date_key, amount in dates.items():
+                dk = date_key.date() if hasattr(date_key, 'date') else date_key
+                if dk == prev_date:
+                    prev_total = amount
+                if dk == curr_date:
+                    curr_total = amount
+            change_total = curr_total - prev_total
+            pct_change_total = (change_total / prev_total * 100) if prev_total > 0 else 0
+            
+            account_summary[account] = {
+                'prev': prev_total,
+                'curr': curr_total,
+                'change': change_total,
+                'pct_change': pct_change_total
+            }
+        
+        # Print account summary first
+        if account_summary:
+            print(f"{'='*60}")
+            print("ACCOUNT TOTALS")
+            print(f"{'='*60}")
+            print(f"{'Account':<30} {'Previous':>12} {'Current':>12} {'Change':>12} {'% Change':>10}")
+            print(f"{'-'*30} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+            
+            for account in sorted(account_summary.keys()):
+                summary = account_summary[account]
+                print(f"{account:<30} ${summary['prev']:>10,.2f} ${summary['curr']:>10,.2f} "
+                      f"${summary['change']:>10,.2f} {summary['pct_change']:>9.2f}%")
+            print()
+        
+        # Print individual changes
+        if changes:
+            print(f"{'='*60}")
+            print("INDIVIDUAL HOLDINGS")
+            print(f"{'='*60}")
+            
+            current_account = None
+            for item in changes:
+                # Print account header when it changes
+                if item['account'] != current_account:
+                    if current_account is not None:
+                        print()  # Blank line between accounts
+                    current_account = item['account']
+                    print(f"\n{current_account}:")
+                    print(f"{'  Ticker':<38} {'Previous':>12} {'Current':>12} {'Change':>12} {'% Change':>10}")
+                    print(f"  {'-'*38} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+                
+                # Extract ticker from key (remove account prefix)
+                ticker = '_'.join(item['key'].split('_')[1:])
+                prev = item['prev']
+                curr = item['curr']
+                change = item['change']
+                pct = item['pct_change']
+                
+                if item['type'] == 'NEW':
+                    print(f"  {ticker:<38} {'NEW':>12} ${curr:>10,.2f} ${change:>10,.2f} {'NEW':>10}")
+                elif item['type'] == 'CLOSED':
+                    print(f"  {ticker:<38} ${prev:>10,.2f} {'CLOSED':>12} ${change:>10,.2f} {'CLOSED':>10}")
+                else:
+                    print(f"  {ticker:<38} ${prev:>10,.2f} ${curr:>10,.2f} ${change:>10,.2f} {pct:>9.2f}%")
+            
+            print(f"\nTotal holdings shown: {len(changes)}")
+        else:
+            print("No changes found.")
+        
+        print(f"{'='*60}\n")
+        
+        self.db.close_db()
     
     def delete_existing_data(self, as_of_date: datetime):
         """
@@ -1051,8 +1061,8 @@ class AssetProcessor:
         Refresh dataconn sheet with data from database queries
         
         Args:
-            currdate: Current date to update in wkdates table and assetref N4
-            datetocompare: Date to compare to update in wkdates table and assetref N3
+            currdate: Current date to update in wkdates table
+            datetocompare: Date to compare to update in wkdates table
         """
         print("=" * 60)
         print("Refreshing Dataconn Sheet")
@@ -1159,8 +1169,26 @@ class AssetProcessor:
                 ws = wb.create_sheet('DataConn')
             else:
                 ws = wb['DataConn']
-                # Clear only the data cells, not formulas
-                # We'll overwrite cells, so no need to delete
+            
+            # Clear existing data in all the columns where we write
+            print("Clearing existing data in DataConn sheet...")
+            # Clear columns A-C (rows 1-100), F-H (rows 1-100), J-L (rows 1-100), O-U (rows 1-100)
+            for row in range(1, 101):
+                # Clear A1:C100
+                ws.cell(row, 1).value = None
+                ws.cell(row, 2).value = None
+                ws.cell(row, 3).value = None
+                # Clear F1:H100
+                ws.cell(row, 6).value = None
+                ws.cell(row, 7).value = None
+                ws.cell(row, 8).value = None
+                # Clear J1:L100
+                ws.cell(row, 10).value = None
+                ws.cell(row, 11).value = None
+                ws.cell(row, 12).value = None
+                # Clear O1:U100
+                for col in range(15, 22):  # O=15 to U=21
+                    ws.cell(row, col).value = None
             
             print("Writing data to DataConn sheet...")
             
@@ -1196,25 +1224,6 @@ class AssetProcessor:
             # Save workbook
             wb.save(self.excel_file)
             print(f"\nDataConn sheet updated successfully in {self.excel_file}")
-            
-            # Update assetref sheet with dates if provided
-            if currdate or datetocompare:
-                print("\nUpdating assetref sheet with dates...")
-                if 'assetref' in wb.sheetnames:
-                    ws_assetref = wb['assetref']
-                    
-                    if datetocompare:
-                        ws_assetref['N3'] = datetocompare
-                        print(f"  Updated N3 (datetocompare) to {datetocompare.strftime('%Y-%m-%d')}")
-                    
-                    if currdate:
-                        ws_assetref['N4'] = currdate
-                        print(f"  Updated N4 (currdate) to {currdate.strftime('%Y-%m-%d')}")
-                    
-                    wb.save(self.excel_file)
-                    print(f"  assetref sheet updated in {self.excel_file}")
-                else:
-                    print("  Warning: assetref sheet not found in workbook")
             
         finally:
             self.db.close_db()
@@ -1365,14 +1374,18 @@ def main():
                        help='Run main asset allocation workflow (default if no other mode specified)')
     parser.add_argument('--normalize', action='store_true',
                        help='Normalize full view data and aggregate by account')
-    parser.add_argument('--normalize-sheet', default='fullview',
-                       help='Sheet name for normalize operation (default: fullview)')
+    parser.add_argument('--normalize-sheet', default='fidfullview',
+                       help='Sheet name for normalize operation (default: fidfullview)')
     parser.add_argument('--output', '-o',
                        help='Output Excel file for normalize results')
-    parser.add_argument('--updateassetref', action='store_true',
-                       help='Update assetref sheet from fullview normalized data')
     parser.add_argument('--refresh-dataconn', action='store_true',
                        help='Refresh dataconn sheet with database query results')
+    parser.add_argument('--compare-dates', action='store_true',
+                       help='Compare asset values between two dates and report significant changes')
+    parser.add_argument('--show-all', action='store_true',
+                       help='Show all changes (ignore threshold) when using --compare-dates')
+    parser.add_argument('--threshold', type=float, default=5.0,
+                       help='Percentage threshold for significant changes (default: 5.0)')
     parser.add_argument('--currdate',
                        help='Current date for wkdates table and assetref N4 (YYYY-MM-DD)')
     parser.add_argument('--datetocompare',
@@ -1414,17 +1427,26 @@ def main():
     
     # Execute based on flags
     if args.normalize:
+        # Update Assetalloc dates
+        processor.update_assetalloc_dates(
+            prevdate=datetocompare.strftime('%Y-%m-%d') if datetocompare else None,
+            currdate=as_of_date.strftime('%Y-%m-%d') if as_of_date else None
+        )
         # Run normalize full view
         processor.normalize_full_view(
             sheet_name=args.normalize_sheet,
             output_file=args.output
         )
-    elif args.updateassetref:
-        # Update assetref from fullview
-        processor.update_asset_ref_from_fullview()
     elif args.refresh_dataconn:
         # Refresh dataconn sheet
         processor.refresh_dataconn(currdate=currdate, datetocompare=datetocompare)
+    elif args.compare_dates:
+        # Compare dates and report significant changes
+        if not currdate or not datetocompare:
+            print("Error: --compare-dates requires --currdate and --datetocompare")
+            sys.exit(1)
+        processor.compare_dates_report(currdate=currdate, datetocompare=datetocompare, 
+                                      threshold_percent=args.threshold, show_all=args.show_all)
     elif args.fix_references:
         # Fix external workbook references
         processor.fix_external_references()
@@ -1432,8 +1454,13 @@ def main():
         processor.delete_existing_data(as_of_date)
     elif args.gains_only:
         processor.calculate_gains(as_of_date)
-    elif args.process or not any([args.normalize, args.updateassetref, args.refresh_dataconn, 
-                                   args.fix_references, args.delete_only, args.gains_only]):
+    elif args.process or not any([args.normalize, args.refresh_dataconn, 
+                                   args.compare_dates, args.fix_references, args.delete_only, args.gains_only]):
+        # Update Assetalloc dates
+        processor.update_assetalloc_dates(
+            prevdate=datetocompare.strftime('%Y-%m-%d') if datetocompare else None,
+            currdate=as_of_date.strftime('%Y-%m-%d') if as_of_date else None
+        )
         # Run main allocation workflow (default)
         processor.run_full_process(
             as_of_date=as_of_date,

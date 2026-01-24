@@ -1,0 +1,8 @@
+instead of using fullview sheet columns A-F to make columns K and L, use the fldfullview sheet now.
+From column B in fldfullview sheet use below account mapping and Symbol from column C and dollar value from column H
+1. Individual - TOD to FidelityInv_
+2. Rollover IRA to FidelityIRA_
+3. Samir S Doshi - Brokerage Account - 10498558 to Vanguard_
+3. Samir S Doshi - Rollover IRA to Vanguard IRA_
+4. if <Column B>_<Column C> values are duplicate, sum up the value from column H.
+4. Continue to use Trow sheet for TrowePrice accounts. 
