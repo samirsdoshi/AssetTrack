@@ -209,6 +209,41 @@ This updates:
 - `wkdates.datetocompare` with the comparison date (2025-12-24)
 - Used for comparing performance between two dates in Excel reports
 
+### Show Available Dates
+
+View all unique dates for which data exists in the database:
+```bash
+python process_assets.py --show-dates
+```
+
+Show only dates after a specific date:
+```bash
+python process_assets.py --show-dates --after-date 2025-12-01
+```
+
+This operation:
+- Queries the database for all unique `asofdate` values in the assetinv table
+- Displays dates in descending order (newest first)
+- Useful for determining which dates have data before running comparisons or refreshes
+- Helps identify available data points for --currdate and --datetocompare parameters
+
+Example output:
+```
+============================================================
+Available Data Dates
+============================================================
+Showing dates after: 2025-12-01
+
+Found 4 unique date(s):
+
+   1. 2026-01-30
+   2. 2026-01-23
+   3. 2026-01-16
+   4. 2025-12-31
+
+============================================================
+```
+
 **Custom Host:**
 ```bash
 python process_assets.py --refresh-dataconn --db-host 192.168.1.10

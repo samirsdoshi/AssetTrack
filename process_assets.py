@@ -172,8 +172,11 @@ class AssetProcessor:
             if account_name == '' or symbol == '':
                 continue
             
+            # Strip trailing ** (e.g. FCASH** -> FCASH, FDRXX** -> FDRXX)
+            symbol = symbol.rstrip('*')
+            
             # Map specific symbols to Cash
-            if symbol in ['FDRXX**', 'FCASH**', 'FDRXX', 'FCASH', 'Pending activity', 'VMRXX', 'VMFXX', 'VMRXX**', 'VMFXX**']:
+            if symbol in ['FDRXX', 'FCASH', 'Pending activity', 'VMRXX', 'VMFXX']:
                 symbol = 'Cash'
             
             # Clean up value if it's a string
@@ -929,7 +932,7 @@ class AssetProcessor:
                     'pct_change': 100.0,
                     'type': 'NEW'
                 })
-            elif prev_amount > 0 and curr_amount == 0:
+            elif prev_amount != 0 and curr_amount == 0:
                 # Closed position
                 changes.append({
                     'key': key,
@@ -940,10 +943,10 @@ class AssetProcessor:
                     'pct_change': -100.0,
                     'type': 'CLOSED'
                 })
-            elif prev_amount > 0:
-                # Changed position
+            elif prev_amount != 0:
+                # Changed position (prev may be negative, e.g. margin balance)
                 change_amount = curr_amount - prev_amount
-                pct_change = (change_amount / prev_amount) * 100
+                pct_change = (change_amount / abs(prev_amount)) * 100
                 
                 # Add to list if show_all or if above threshold
                 if show_all or abs(pct_change) >= threshold_percent:
@@ -1002,10 +1005,19 @@ class AssetProcessor:
             print(f"{'='*60}")
             
             current_account = None
-            for item in changes:
+            for i, item in enumerate(changes):
                 # Print account header when it changes
                 if item['account'] != current_account:
+                    # Print summary line for the previous account before switching
                     if current_account is not None:
+                        summary = account_summary.get(current_account, {})
+                        if summary:
+                            print(f"  {'-'*38} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+                            sprev = summary['prev']
+                            scurr = summary['curr']
+                            schange = summary['change']
+                            spct = summary['pct_change']
+                            print(f"  {'TOTAL':<38} ${sprev:>10,.2f} ${scurr:>10,.2f} ${schange:>10,.2f} {spct:>9.2f}%")
                         print()  # Blank line between accounts
                     current_account = item['account']
                     print(f"\n{current_account}:")
@@ -1025,6 +1037,17 @@ class AssetProcessor:
                     print(f"  {ticker:<38} ${prev:>10,.2f} {'CLOSED':>12} ${change:>10,.2f} {'CLOSED':>10}")
                 else:
                     print(f"  {ticker:<38} ${prev:>10,.2f} ${curr:>10,.2f} ${change:>10,.2f} {pct:>9.2f}%")
+                
+                # Print summary line after the last item in the last account
+                if i == len(changes) - 1 and current_account is not None:
+                    summary = account_summary.get(current_account, {})
+                    if summary:
+                        print(f"  {'-'*38} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+                        sprev = summary['prev']
+                        scurr = summary['curr']
+                        schange = summary['change']
+                        spct = summary['pct_change']
+                        print(f"  {'TOTAL':<38} ${sprev:>10,.2f} ${scurr:>10,.2f} ${schange:>10,.2f} {spct:>9.2f}%")
             
             print(f"\nTotal holdings shown: {len(changes)}")
         else:
@@ -1067,6 +1090,13 @@ class AssetProcessor:
         print("=" * 60)
         print("Refreshing Dataconn Sheet")
         print("=" * 60)
+        
+        # Update Assetalloc sheet dates if provided
+        if currdate and datetocompare:
+            self.update_assetalloc_dates(
+                prevdate=datetocompare.strftime('%Y-%m-%d'),
+                currdate=currdate.strftime('%Y-%m-%d')
+            )
         
         from openpyxl import load_workbook
         
@@ -1350,6 +1380,62 @@ class AssetProcessor:
         print("Processing Complete!")
         print("=" * 60)
 
+    def show_unique_dates(self, after_date: datetime = None):
+        """
+        Show unique dates for which there is data, optionally filtered after a given date
+        
+        Args:
+            after_date: Optional date to filter results - only show dates after this date
+        """
+        print(f"\n{'='*60}")
+        print(f"Available Data Dates")
+        print(f"{'='*60}")
+        if after_date:
+            print(f"Showing dates after: {after_date.strftime('%Y-%m-%d')}\n")
+        else:
+            print(f"Showing all available dates\n")
+        
+        self.db.open_db()
+        
+        # Query to get unique dates from assetinv table
+        if after_date:
+            query = """
+                SELECT DISTINCT asofdate 
+                FROM assetinv 
+                WHERE asofdate > %s
+                ORDER BY asofdate DESC
+            """
+            results = self.db.execute_query(query, (after_date.strftime('%Y-%m-%d'),))
+        else:
+            query = """
+                SELECT DISTINCT asofdate 
+                FROM assetinv 
+                ORDER BY asofdate DESC
+            """
+            results = self.db.execute_query(query)
+        
+        self.db.close_db()
+        
+        if not results:
+            if after_date:
+                print(f"No data found after {after_date.strftime('%Y-%m-%d')}")
+            else:
+                print("No data found in database")
+            return
+        
+        # Display the dates
+        print(f"Found {len(results)} unique date(s):\n")
+        for i, row in enumerate(results, 1):
+            date_val = row['asofdate']
+            # Handle both datetime and date objects
+            if isinstance(date_val, datetime):
+                date_str = date_val.strftime('%Y-%m-%d')
+            else:
+                date_str = str(date_val)
+            print(f"  {i:2d}. {date_str}")
+        
+        print(f"\n{'='*60}")
+
 
 def main():
     """Main entry point"""
@@ -1392,6 +1478,10 @@ def main():
                        help='Date to compare for wkdates table and assetref N3 (YYYY-MM-DD)')
     parser.add_argument('--fix-references', action='store_true',
                        help='Fix external workbook references in formulas')
+    parser.add_argument('--show-dates', action='store_true',
+                       help='Show unique dates for which there is data in the database')
+    parser.add_argument('--after-date',
+                       help='Filter dates to show only those after this date (YYYY-MM-DD). Use with --show-dates')
     
     args = parser.parse_args()
     
@@ -1422,11 +1512,23 @@ def main():
             print("Error: Invalid datetocompare format. Use YYYY-MM-DD")
             sys.exit(1)
     
+    # Parse after_date if provided
+    after_date = None
+    if args.after_date:
+        try:
+            after_date = datetime.strptime(args.after_date, '%Y-%m-%d')
+        except ValueError:
+            print("Error: Invalid after-date format. Use YYYY-MM-DD")
+            sys.exit(1)
+    
     # Create processor
     processor = AssetProcessor(args.file)
     
     # Execute based on flags
-    if args.normalize:
+    if args.show_dates:
+        # Show unique dates with optional filtering
+        processor.show_unique_dates(after_date=after_date)
+    elif args.normalize:
         # Update Assetalloc dates
         processor.update_assetalloc_dates(
             prevdate=datetocompare.strftime('%Y-%m-%d') if datetocompare else None,
@@ -1455,7 +1557,8 @@ def main():
     elif args.gains_only:
         processor.calculate_gains(as_of_date)
     elif args.process or not any([args.normalize, args.refresh_dataconn, 
-                                   args.compare_dates, args.fix_references, args.delete_only, args.gains_only]):
+                                   args.compare_dates, args.fix_references, args.delete_only, 
+                                   args.gains_only, args.show_dates]):
         # Update Assetalloc dates
         processor.update_assetalloc_dates(
             prevdate=datetocompare.strftime('%Y-%m-%d') if datetocompare else None,
