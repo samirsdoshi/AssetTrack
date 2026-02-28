@@ -429,6 +429,24 @@ Ensure Asset.xls is in the same directory or provide full path:
 python process_assets.py --file /path/to/Asset.xls
 ```
 
+## MySQL Backup and Restore
+
+Create a database backup:
+```bash
+./processall.sh backup
+```
+
+Restore from a backup SQL file:
+```bash
+./restore_mysql.sh backup/asset_2026-02-27.sql
+```
+
+Optional environment overrides for restore:
+- `MYSQL_CONTAINER` (default: `assets`)
+- `MYSQL_USER` (default: `root`)
+- `MYSQL_PASSWORD` (default: `sa123`)
+- `MYSQL_DATABASE` (default: `asset`)
+
 ## Backup to Google Drive
 
 Upload SQL backups and Excel file to Google Drive:
