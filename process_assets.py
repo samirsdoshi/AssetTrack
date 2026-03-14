@@ -9,6 +9,7 @@ from asset_processor import AssetDatabase, AssetAllocator, GainCalculator, Templ
 from utils import filter_ticker, get_held_at, empty_to_default, clean_up
 import sys
 import os
+import csv
 from dotenv import load_dotenv
 import msoffcrypto
 import io
@@ -45,6 +46,119 @@ class AssetProcessor:
         self.allocator = AssetAllocator(self.db)
         self.gain_calculator = GainCalculator(self.db)
         self.template_manager = TemplateManager(self.db)
+
+    @staticmethod
+    def _parse_currency_value(value):
+        """Convert currency-like strings to float, returning None when invalid."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = str(value).strip()
+        if text == '' or text == '-':
+            return None
+
+        # Handle accounting format like (1,234.56)
+        is_negative = text.startswith('(') and text.endswith(')')
+        cleaned = text.replace('$', '').replace(',', '').replace('%', '').strip('()').strip()
+
+        try:
+            amount = float(cleaned)
+            return -amount if is_negative else amount
+        except ValueError:
+            return None
+
+    def read_trow_csv_entries(self, csv_path: str) -> list:
+        """
+        Read T. Rowe Price holdings from CSV and return normalized account_ticker entries.
+
+        CSV format contains two sections:
+        1) Account holdings table with account type/ticker/market value.
+        2) Retirement plan table after 'Investment Name,Amount'.
+        """
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Trow CSV file not found: {csv_path}")
+
+        account_mapping = {
+            'Rollover IRA': 'TRPRollover',
+            'Individual': 'TRPInv',
+            'Roth IRA': 'TRPRoth',
+        }
+
+        entries = []
+        trprps_by_ticker = {}
+        in_rps_section = False
+
+        trprps_mapping = {
+            'VANGUARD INST EXT MKT IDX D': 'VIIIX',
+            'VANGUARD INST 500 IDX TR D': 'VIEIX',
+            'TRP STABLE VALUE COMM TR FD-N': 'Cash',
+            'VANGUARD FTSE SOCIAL INDEX I': 'VFTNX',
+        }
+
+        with open(csv_path, 'r', newline='', encoding='utf-8-sig') as f:
+            reader = csv.reader(f)
+
+            for raw_row in reader:
+                row = [cell.strip() if cell is not None else '' for cell in raw_row]
+                if not row or all(cell == '' for cell in row):
+                    continue
+
+                # Detect second table header: Investment Name,Amount
+                if len(row) >= 2 and row[0].lower() == 'investment name' and row[1].lower() == 'amount':
+                    in_rps_section = True
+                    continue
+
+                if in_rps_section:
+                    # Map retirement-plan investment names into TRPRps tickers/cash.
+                    if len(row) < 2:
+                        continue
+                    inv_name = row[0]
+                    amount = self._parse_currency_value(row[1])
+                    if amount is None or amount == 0:
+                        continue
+
+                    mapped_ticker = trprps_mapping.get(inv_name)
+                    if mapped_ticker:
+                        trprps_by_ticker[mapped_ticker] = trprps_by_ticker.get(mapped_ticker, 0.0) + amount
+                    elif inv_name.upper().startswith('TRP RETIREMENT BLEND'):
+                        trprps_by_ticker['TRRIX'] = trprps_by_ticker.get('TRRIX', 0.0) + amount
+                    continue
+
+                # Skip the first section header row.
+                if len(row) >= 1 and row[0].lower() == 'account type':
+                    continue
+
+                if len(row) < 9:
+                    continue
+
+                account_type = row[0]
+                ticker = row[2]
+                market_value = self._parse_currency_value(row[8])
+
+                account_prefix = account_mapping.get(account_type)
+                if not account_prefix:
+                    continue
+
+                # Match existing Trow behavior: skip blank ticker and zero/empty value.
+                if ticker == '' or market_value is None or market_value == 0:
+                    continue
+
+                entries.append({
+                    'account_ticker': f"{account_prefix}_{ticker}",
+                    'amount': market_value
+                })
+
+        for ticker, total_amount in trprps_by_ticker.items():
+            if total_amount == 0:
+                continue
+            entries.append({
+                'account_ticker': f'TRPRps_{ticker}',
+                'amount': total_amount
+            })
+
+        return entries
     
     def convert_xls_to_xlsx(self, xls_file: str, xlsx_file: str):
         """
@@ -194,7 +308,7 @@ class AssetProcessor:
             # Map account name to prefix
             account_prefix = account_mapping.get(account_name, None)
             
-            # Skip if account not in mapping (will be handled by Trow sheet)
+            # Skip if account not in mapping (handled separately by trow.csv)
             if not account_prefix:
                 continue
             
@@ -226,119 +340,17 @@ class AssetProcessor:
         if len(results_df) > 0:
             results_df = results_df[results_df['amount'] != 0]
         
-        # Read Trow sheet and manually compute columns N and O from source columns
-        # Column N formula: =CONCAT(M,"_",C) - concatenates column M (account) and C (ticker)
-        # Column O formula: =I - market value
-        # Also read pre-formatted entries directly from N and O
+        # Read Trow holdings from CSV and append using the same account_ticker/amount shape.
         try:
-            print("Reading Trow sheet data...")
-            trow_df = self.decrypt_and_read_excel('Trow', header=None)
-            
-            # First pass: Extract and compute values from columns C (ticker), I (amount), M (account)
-            # Skip header row (index 0)
-            added_count = 0
-            for idx, row in trow_df.iterrows():
-                if idx == 0:  # Skip header row
-                    continue
-                    
-                account = row.get(12)  # Column M (index 12)
-                ticker = row.get(2)    # Column C (index 2)
-                amount = row.get(8)    # Column I (index 8)
-                
-                # Skip if any required field is empty
-                if pd.isna(account) or pd.isna(ticker) or pd.isna(amount):
-                    continue
-                
-                # Skip if account or ticker is empty string
-                if str(account).strip() == '' or str(ticker).strip() == '':
-                    continue
-                
-                # Clean up amount if it's a string
-                if isinstance(amount, str):
-                    amount = amount.replace('$', '').replace(',', '')
-                    try:
-                        amount = float(amount)
-                    except:
-                        continue
-                
-                # Skip if amount is 0
-                if amount == 0:
-                    continue
-                
-                # Construct account_ticker (equivalent to column N formula)
-                account_ticker = f"{account}_{ticker}"
-                
-                # Add to results
-                results_df = pd.concat([results_df, pd.DataFrame([{
-                    'account_ticker': account_ticker,
-                    'amount': amount
-                }])], ignore_index=True)
-                added_count += 1
-            
-            # Second pass: Read pre-formatted entries from columns N and O
-            # This handles rows where N already has "Account_Ticker" format
-            # Need to evaluate formulas in column O by reading from data_only=False and calculating
-            from openpyxl import load_workbook
-            try:
-                wb_formulas = load_workbook(self.excel_file, data_only=False)
-                wb_data = load_workbook(self.excel_file, data_only=True)
-                ws_f = wb_formulas['Trow']
-                ws_d = wb_data['Trow']
-                
-                for row_idx in range(1, 100):
-                    n_val = ws_d[f'N{row_idx}'].value
-                    o_formula = ws_f[f'O{row_idx}'].value
-                    
-                    # Skip if N is empty or doesn't contain "_"
-                    if not n_val or '_' not in str(n_val):
-                        continue
-                    
-                    # Try to evaluate formula in O
-                    amount = None
-                    if o_formula and str(o_formula).startswith('='):
-                        # Formula exists but not evaluated - try to manually evaluate simple cases
-                        formula_str = str(o_formula)[1:]  # Remove '='
-                        
-                        # Handle simple cell references like "A45"
-                        if formula_str.startswith('A') and formula_str[1:].isdigit():
-                            ref_row = int(formula_str[1:])
-                            amount = ws_d[f'A{ref_row}'].value
-                        # Handle addition like "A37+A41"
-                        elif '+' in formula_str:
-                            parts = formula_str.split('+')
-                            total = 0
-                            for part in parts:
-                                part = part.strip()
-                                if part.startswith('A') and part[1:].isdigit():
-                                    ref_row = int(part[1:])
-                                    val = ws_d[f'A{ref_row}'].value
-                                    if val:
-                                        total += float(val)
-                            amount = total if total > 0 else None
-                    elif o_formula:
-                        # Direct value
-                        amount = o_formula
-                    
-                    if amount and amount != 0:
-                        # Clean up amount if needed
-                        if isinstance(amount, str):
-                            amount = amount.replace('$', '').replace(',', '')
-                            try:
-                                amount = float(amount)
-                            except:
-                                continue
-                        
-                        results_df = pd.concat([results_df, pd.DataFrame([{
-                            'account_ticker': str(n_val),
-                            'amount': amount
-                        }])], ignore_index=True)
-                        added_count += 1
-            except Exception as e:
-                print(f"Could not read pre-formatted N/O columns: {e}")
-            
-            print(f"Added {added_count} entries from Trow sheet")
+            trow_csv_path = os.path.join(os.path.dirname(os.path.abspath(self.excel_file)), 'trow.csv')
+            print(f"Reading Trow data from CSV: {trow_csv_path}")
+            trow_entries = self.read_trow_csv_entries(trow_csv_path)
+
+            if trow_entries:
+                results_df = pd.concat([results_df, pd.DataFrame(trow_entries)], ignore_index=True)
+            print(f"Added {len(trow_entries)} entries from trow.csv")
         except Exception as e:
-            print(f"Warning: Could not read Trow sheet: {e}")
+            print(f"Warning: Could not read trow.csv: {e}")
         
         # Sort final results
         results_df = results_df.sort_values(by='account_ticker', ascending=True)
@@ -992,10 +1004,19 @@ class AssetProcessor:
             print(f"{'Account':<30} {'Previous':>12} {'Current':>12} {'Change':>12} {'% Change':>10}")
             print(f"{'-'*30} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
             
+            grand_prev = 0
+            grand_curr = 0
             for account in sorted(account_summary.keys()):
                 summary = account_summary[account]
                 print(f"{account:<30} ${summary['prev']:>10,.2f} ${summary['curr']:>10,.2f} "
                       f"${summary['change']:>10,.2f} {summary['pct_change']:>9.2f}%")
+                grand_prev += summary['prev']
+                grand_curr += summary['curr']
+            grand_change = grand_curr - grand_prev
+            grand_pct = (grand_change / grand_prev * 100) if grand_prev > 0 else 0
+            print(f"{'-'*30} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+            print(f"{'TOTAL':<30} ${grand_prev:>10,.2f} ${grand_curr:>10,.2f} "
+                  f"${grand_change:>10,.2f} {grand_pct:>9.2f}%")
             print()
         
         # Print individual changes
