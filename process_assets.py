@@ -75,7 +75,7 @@ class AssetProcessor:
 
         CSV format contains two sections:
         1) Account holdings table with account type/ticker/market value.
-        2) Retirement plan table after 'Investment Name,Amount'.
+        2) Retirement plan table after a 'TRPRps' marker line where rows are name$amt.
         """
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"Trow CSV file not found: {csv_path}")
@@ -105,17 +105,30 @@ class AssetProcessor:
                 if not row or all(cell == '' for cell in row):
                     continue
 
-                # Detect second table header: Investment Name,Amount
+                # Detect second section marker: TRPRps
+                if len(row) >= 1 and row[0].strip().lower() == 'trprps':
+                    in_rps_section = True
+                    continue
+
+                # Backward compatibility with older second-table header.
                 if len(row) >= 2 and row[0].lower() == 'investment name' and row[1].lower() == 'amount':
                     in_rps_section = True
                     continue
 
                 if in_rps_section:
-                    # Map retirement-plan investment names into TRPRps tickers/cash.
-                    if len(row) < 2:
+                    # Parse rows in the form: Investment Name$123,456.78
+                    if len(row) < 1:
                         continue
-                    inv_name = row[0]
-                    amount = self._parse_currency_value(row[1])
+
+                    # Amounts include commas and are unquoted in trow.csv, so csv.reader
+                    # may split a single logical row into multiple columns.
+                    line = ','.join(row).strip()
+                    if '$' not in line:
+                        continue
+
+                    inv_name, amt_part = line.rsplit('$', 1)
+                    inv_name = inv_name.strip()
+                    amount = self._parse_currency_value(f'${amt_part.strip()}')
                     if amount is None or amount == 0:
                         continue
 
@@ -158,6 +171,85 @@ class AssetProcessor:
                 'amount': total_amount
             })
 
+        return entries
+    
+    def read_stocks_csv_entries(self, csv_path: str) -> list:
+        """
+        Read stock holdings from CSV and calculate Stock = Total - Cash.
+        
+        CSV format has three columns (no header, tab-delimited):
+        1. Account name
+        2. Category (Stock, Cash, Total)
+        3. Value
+        
+        Returns a list of entries with account_ticker and amount
+        """
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Stocks CSV file not found: {csv_path}")
+        
+        accounts = {}  # Dict to store {account_name: {Stock, Cash, Total}}
+        entries = []
+        
+        with open(csv_path, 'r', newline='', encoding='utf-8-sig') as f:
+            reader = csv.reader(f, delimiter='\t')
+            
+            for raw_row in reader:
+                row = [cell.strip() if cell is not None else '' for cell in raw_row]
+                
+                # Skip empty rows
+                if not row or all(cell == '' for cell in row):
+                    continue
+                
+                # Skip rows with insufficient columns
+                if len(row) < 3:
+                    continue
+                
+                account_name = row[0].strip()
+                category = row[1].strip()
+                
+                # Skip if account or category is empty
+                if not account_name or not category:
+                    continue
+                
+                try:
+                    value = float(row[2])
+                except (ValueError, IndexError):
+                    continue
+                
+                # Initialize account dict if needed
+                if account_name not in accounts:
+                    accounts[account_name] = {'Stock': None, 'Cash': None, 'Total': None}
+                
+                # Store the value by category
+                if category in accounts[account_name]:
+                    accounts[account_name][category] = value
+        
+        # Calculate Stock = Total - Cash for each account and create entries
+        for account_name, values in accounts.items():
+            total = values.get('Total')
+            cash = values.get('Cash')
+            
+            # Skip if we don't have Total and Cash values
+            if total is None or cash is None:
+                continue
+            
+            # Add Cash entry if non-zero
+            if cash != 0:
+                entries.append({
+                    'account_ticker': f'{account_name}_Cash',
+                    'amount': cash
+                })
+            
+            # Calculate and add stock value
+            stock_value = total - cash
+            
+            # Add Stock entry if non-zero
+            if stock_value != 0:
+                entries.append({
+                    'account_ticker': f'{account_name}_Stock',
+                    'amount': stock_value
+                })
+        
         return entries
     
     def convert_xls_to_xlsx(self, xls_file: str, xlsx_file: str):
@@ -243,22 +335,29 @@ class AssetProcessor:
     
     def normalize_full_view(self, sheet_name: str = 'fidfullview', output_file: str = None) -> pd.DataFrame:
         """
-        Normalize and aggregate fidfullview data by account
+        Normalize and aggregate Fidelity data by account
+        Reads data from Fidelity.csv instead of Excel sheet
         Converted from VBA normalizefullview() function
         
         Args:
-            sheet_name: Name of the sheet to process (default: 'fidfullview')
+            sheet_name: Deprecated - kept for backward compatibility
             output_file: Optional output Excel file to save results
             
         Returns:
             DataFrame with normalized data
         """
-        print(f"Normalizing full view from sheet '{sheet_name}'...")
+        print(f"Reading Fidelity data from Fidelity.csv...")
         
-        # Read the fidfullview sheet (has header row)
-        df = self.decrypt_and_read_excel(sheet_name, header=0)
+        # Read Fidelity.csv - it has header row with columns: Account Name, Symbol, Current Value, etc.
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(self.excel_file)), 'Fidelity.csv')
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Fidelity.csv not found at {csv_path}")
         
-        # Account mapping based on Column B values
+        # Read CSV - due to trailing commas in data, columns are shifted by 1
+        # We'll use positional indexing to get the correct columns
+        df_raw = pd.read_csv(csv_path)
+        
+        # Account mapping based on Account Name values
         account_mapping = {
             'Individual - TOD': 'FidelityInv',
             'Rollover IRA': 'FidelityIRA',
@@ -269,12 +368,17 @@ class AssetProcessor:
         account_data = {}  # Dictionary to store aggregated amounts by account
         ticker_data = {}  # Dictionary to aggregate by account_ticker combination
         
-        # Process each row
-        for idx, row in df.iterrows():
-            # Get values from named columns (B='Account Name', C='Symbol', H='Current Value')
-            account_name = row.get('Account Name') or row.iloc[1] if len(row) > 1 else None
-            symbol = row.get('Symbol') or row.iloc[2] if len(row) > 2 else None
-            value = row.get('Current Value') or row.iloc[7] if len(row) > 7 else None
+        # Process each row using positional indexing
+        for idx, row in df_raw.iterrows():
+            # Due to trailing commas, columns are shifted:
+            # Column 0 (Account Number) contains Account Name
+            # Column 1 (Account Name) contains Symbol
+            # Column 2 (Symbol) contains Description
+            # Column 6 (Last Price Change) contains Current Value
+            account_name = row.iloc[0]  # From Account Number column
+            symbol = row.iloc[1]  # From Account Name column
+            description = row.iloc[2]  # From Symbol column
+            value = row.iloc[6]  # From Last Price Change column
             
             # Skip if any required field is missing or empty
             if pd.isna(account_name) or pd.isna(symbol) or pd.isna(value):
@@ -286,12 +390,17 @@ class AssetProcessor:
             if account_name == '' or symbol == '':
                 continue
             
-            # Strip trailing ** (e.g. FCASH** -> FCASH, FDRXX** -> FDRXX)
-            symbol = symbol.rstrip('*')
-            
-            # Map specific symbols to Cash
-            if symbol in ['FDRXX', 'FCASH', 'Pending activity', 'VMRXX', 'VMFXX']:
-                symbol = 'Cash'
+            # Handle stock entries where Symbol='Stock'
+            if symbol == 'Stock':
+                # Keep symbol as 'Stock' so all individual stocks are aggregated
+                symbol = 'Stock'
+            else:
+                # Strip trailing ** (e.g. FCASH** -> FCASH, FDRXX** -> FDRXX)
+                symbol = symbol.rstrip('*')
+                
+                # Map specific symbols to Cash
+                if symbol in ['FDRXX', 'FCASH', 'Pending activity', 'VMRXX', 'VMFXX']:
+                    symbol = 'Cash'
             
             # Clean up value if it's a string
             if isinstance(value, str):
@@ -352,6 +461,18 @@ class AssetProcessor:
         except Exception as e:
             print(f"Warning: Could not read trow.csv: {e}")
         
+        # Read stock account data from CSV and append
+        try:
+            stocks_csv_path = os.path.join(os.path.dirname(os.path.abspath(self.excel_file)), 'stocks.csv')
+            print(f"Reading Stock account data from CSV: {stocks_csv_path}")
+            stock_entries = self.read_stocks_csv_entries(stocks_csv_path)
+            
+            if stock_entries:
+                results_df = pd.concat([results_df, pd.DataFrame(stock_entries)], ignore_index=True)
+            print(f"Added {len(stock_entries)} entries from stocks.csv")
+        except Exception as e:
+            print(f"Warning: Could not read stocks.csv: {e}")
+        
         # Sort final results
         results_df = results_df.sort_values(by='account_ticker', ascending=True)
         
@@ -366,131 +487,13 @@ class AssetProcessor:
         for _, row in summary_df.iterrows():
             print(f"  {row['account']}: ${row['total']:,.2f}")
         
-        # Write results back to the fullview sheet (columns K, L, N, O)
-        # Note: We read from fldfullview sheet but write results to fullview sheet for compatibility
+        # Write results to allaccounts.csv
         try:
-            from openpyxl import load_workbook
-            from zipfile import ZipFile
-            
-            print("\nWriting results back to fullview sheet...")
-            
-            # Handle .xlsx format with openpyxl
-            # Decrypt and load workbook if needed
-            if self.excel_password:
-                try:
-                    decrypted = io.BytesIO()
-                    with open(self.excel_file, 'rb') as f:
-                        office_file = msoffcrypto.OfficeFile(f)
-                        office_file.load_key(password=self.excel_password)
-                        office_file.decrypt(decrypted)
-                    decrypted.seek(0)
-                    
-                    # Remove external references from the zip
-                    cleaned = io.BytesIO()
-                    with ZipFile(decrypted, 'r') as zin:
-                        with ZipFile(cleaned, 'w') as zout:
-                            for item in zin.infolist():
-                                if 'externalLink' not in item.filename and 'externalReferences' not in item.filename:
-                                    data = zin.read(item.filename)
-                                    zout.writestr(item, data)
-                    cleaned.seek(0)
-                    wb = load_workbook(cleaned, data_only=False)
-                except:
-                    wb = load_workbook(self.excel_file, data_only=False)
-            else:
-                wb = load_workbook(self.excel_file, data_only=False)
-            
-            # Always write results to 'fullview' sheet (not the source sheet)
-            ws = wb['fullview']
-            
-            # IMPORTANT: Read stock account data from N, O, P BEFORE clearing columns
-            # Need to evaluate formulas in column P, so load both formula and data versions
-            wb_data = load_workbook(self.excel_file, data_only=True)
-            ws_data = wb_data['fullview']
-            
-            stock_account_entries = []
-            print("\nReading stock account entries from columns N, O, P...")
-            for row_idx in range(1, 1000):
-                account = ws[f'N{row_idx}'].value
-                ticker = ws[f'O{row_idx}'].value
-                amount_formula = ws[f'P{row_idx}'].value
-                amount_value = ws_data[f'P{row_idx}'].value
-                
-                # Skip if account or ticker is empty or if ticker is "Total"
-                if not account or not ticker or ticker == 'Total':
-                    continue
-                
-                # Get amount - prefer calculated value, fallback to formula evaluation
-                amount = amount_value
-                
-                # If amount is still None/empty but there's a formula, try to evaluate it
-                if not amount and amount_formula and str(amount_formula).startswith('='):
-                    formula_str = str(amount_formula)[1:]  # Remove '='
-                    # Handle simple cases like "P3-P2"
-                    if '-' in formula_str:
-                        parts = formula_str.split('-')
-                        if len(parts) == 2:
-                            val1 = val2 = 0
-                            p1 = parts[0].strip()
-                            p2 = parts[1].strip()
-                            if p1.startswith('P') and p1[1:].isdigit():
-                                val1 = ws_data[p1].value or 0
-                            if p2.startswith('P') and p2[1:].isdigit():
-                                val2 = ws_data[p2].value or 0
-                            amount = val1 - val2
-                
-                # Skip if amount is still empty or 0
-                if not amount or amount == 0:
-                    continue
-                
-                # Store the entry
-                stock_account_entries.append({
-                    'account': account,
-                    'ticker': ticker,
-                    'amount': amount
-                })
-            
-            print(f"Found {len(stock_account_entries)} stock account entries")
-            
-            # Clear ONLY columns K and L (rows 1-2000) - DO NOT touch N, O, P
-            for row in range(1, 2001):
-                ws[f'K{row}'].value = None
-                ws[f'L{row}'].value = None
-            
-            # Write fund results to columns K and L
-            j = 1
-            for _, row in results_df.iterrows():
-                ws[f'K{j}'].value = row['account_ticker']
-                ws[f'L{j}'].value = row['amount']
-                j += 1
-            
-            # Append stock account entries (read earlier from N, O, P) to K and L
-            print(f"\nAppending {len(stock_account_entries)} stock account entries to columns K and L...")
-            stock_appended = 0
-            
-            for entry in stock_account_entries:
-                account = entry['account']
-                ticker = entry['ticker']
-                amount = entry['amount']
-                
-                # Create account_ticker format: Account_Ticker
-                account_ticker = f"{account}_{ticker}"
-                
-                # Append to columns K and L
-                ws[f'K{j}'].value = account_ticker
-                ws[f'L{j}'].value = amount
-                j += 1
-                stock_appended += 1
-            
-            print(f"Appended {stock_appended} stock account entries")
-            
-            # Save the workbook
-            wb.save(self.excel_file)
-            print(f"Results written to {self.excel_file} in columns K and L")
-            
+            csv_output_path = os.path.join(os.path.dirname(os.path.abspath(self.excel_file)), 'allaccounts.csv')
+            results_df.to_csv(csv_output_path, index=False)
+            print(f"\nResults written to {csv_output_path}")
         except Exception as e:
-            print(f"Warning: Could not write back to Excel file: {e}")
-            print("Results are still available in the returned DataFrames")
+            print(f"Warning: Could not write to allaccounts.csv: {e}")
         
         # Save to separate output file if specified
         if output_file:
@@ -590,56 +593,59 @@ class AssetProcessor:
     
     def read_asset_reference_sheet(self, sheet_name: str = 'fullview') -> pd.DataFrame:
         """
-        Read asset data directly from fullview sheet columns K and L
-        Column K contains account_ticker (e.g., "FidelityInv_FXAIX", "Etrade_Cash")
-        Column L contains amount
+        Read asset data from allaccounts.csv
+        Columns: account_ticker (e.g., "FidelityInv_FXAIX", "Etrade_Cash"), amount
         
         Args:
-            sheet_name: Name of the sheet to read (default: fullview)
+            sheet_name: Deprecated parameter (kept for backward compatibility)
             
         Returns:
-            DataFrame with columns: Ticker (account_ticker), Amount, HeldAt
+            DataFrame with columns: Ticker, Amount, HeldAt
         """
         try:
-            # Read fullview sheet without header
-            df = self.decrypt_and_read_excel(sheet_name, header=None)
+            csv_path = os.path.join(os.path.dirname(os.path.abspath(self.excel_file)), 'allaccounts.csv')
             
-            # Extract data from columns K (index 10) and L (index 11)
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(f"allaccounts.csv not found at {csv_path}")
+            
+            # Read CSV file
+            df = pd.read_csv(csv_path)
+            
+            # Extract data from account_ticker and amount columns
             all_data = []
             
             for idx, row in df.iterrows():
-                # Get values from columns K and L
-                account_ticker_k = row.get(10)  # Column K
-                amount_l = row.get(11)  # Column L
+                account_ticker = row.get('account_ticker')
+                amount = row.get('amount')
                 
-                if pd.notna(account_ticker_k) and pd.notna(amount_l) and amount_l != 0:
+                if pd.notna(account_ticker) and pd.notna(amount) and amount != 0:
                     # Clean up amount
-                    if isinstance(amount_l, str):
-                        amount_l = amount_l.replace('$', '').replace(',', '')
+                    if isinstance(amount, str):
+                        amount = amount.replace('$', '').replace(',', '')
                         try:
-                            amount_l = float(amount_l)
+                            amount = float(amount)
                         except:
                             continue
                     
                     # Split account_ticker to get account and ticker
-                    account_ticker_str = str(account_ticker_k)
+                    account_ticker_str = str(account_ticker)
                     if '_' in account_ticker_str:
                         held_at, ticker = account_ticker_str.split('_', 1)
                         all_data.append({
                             'Ticker': ticker,
-                            'Amount': amount_l,
+                            'Amount': amount,
                             'HeldAt': held_at
                         })
             
             result_df = pd.DataFrame(all_data)
             
-            print(f"Successfully read {len(result_df)} entries from '{sheet_name}' columns K and L")
+            print(f"Successfully read {len(result_df)} entries from allaccounts.csv")
             return result_df
-        except FileNotFoundError:
-            print(f"Error: File '{self.excel_file}' not found")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
             sys.exit(1)
         except Exception as e:
-            print(f"Error reading Excel file: {e}")
+            print(f"Error reading allaccounts.csv: {e}")
             sys.exit(1)
     
     def process_asset_allocation(self, df: pd.DataFrame, as_of_date: datetime, held_at_column: str = 'HeldAt'):

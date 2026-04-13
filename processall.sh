@@ -76,8 +76,8 @@ action=${1:-main}
 threshold=${2:-0.5}
 
 source ~/development/python/.venv/bin/activate
-currdate="2026-03-13"
-prevdate="2026-03-06"
+currdate="2026-04-10"
+prevdate="2026-04-03"
 
 ensure_docker_ready
 ensure_assets_container_running
@@ -93,7 +93,17 @@ elif [ "$action" = "compare" ]; then
     python process_assets.py --refresh-dataconn --currdate "$currdate" --datetocompare "$prevdate"
     python process_assets.py --compare-dates --currdate "$currdate" --datetocompare "$prevdate" --threshold "$threshold" --show-all > out.txt
 elif [ "$action" = "backup" ]; then
+    echo "Backing up database for ${currdate}..."
     docker exec -i assets mysqldump -u root -psa123 --single-transaction --set-gtid-purged=OFF --databases asset > "backup/asset_${currdate}.sql"
+    echo "Database backup complete: backup/asset_${currdate}.sql"
+    
+    echo "Backing up CSV source files for ${currdate}..."
+    [ -f "Fidelity.csv" ] && cp "Fidelity.csv" "backup/Fidelity_${currdate}.csv" && echo "  Backed up: Fidelity_${currdate}.csv"
+    [ -f "trow.csv" ] && cp "trow.csv" "backup/trow_${currdate}.csv" && echo "  Backed up: trow_${currdate}.csv"
+    [ -f "stocks.csv" ] && cp "stocks.csv" "backup/stocks_${currdate}.csv" && echo "  Backed up: stocks_${currdate}.csv"
+    [ -f "allaccounts.csv" ] && cp "allaccounts.csv" "backup/allaccounts_${currdate}.csv" && echo "  Backed up: allaccounts_${currdate}.csv"
+    
+    echo "Uploading backups to Google Drive..."
     python upload_to_gdrive.py
 elif [ "$action" = "restore" ]; then
     backup_file="${2:-}"

@@ -134,6 +134,7 @@ def main():
     # Find files to upload
     sql_files = glob.glob('backup/asset*.sql')
     excel_file = 'Asset.xlsx'
+    csv_files = glob.glob('backup/*_20*.csv')  # Matches Fidelity_2026-04-03.csv, etc.
     
     files_to_upload = []
     
@@ -143,6 +144,13 @@ def main():
         print(f"\nFound {len(sql_files)} SQL backup file(s)")
     else:
         print("\nNo asset*.sql files found")
+    
+    # Add CSV backup files
+    if csv_files:
+        files_to_upload.extend(csv_files)
+        print(f"Found {len(csv_files)} CSV backup file(s)")
+    else:
+        print("No CSV backup files found")
     
     # Add Excel file
     if os.path.exists(excel_file):

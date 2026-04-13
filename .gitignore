@@ -9,3 +9,6 @@ data/
 credentials.json
 token.pickle
 backup/
+trow.csv
+Fidelity.csv
+stocks.csv
