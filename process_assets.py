@@ -89,12 +89,15 @@ class AssetProcessor:
         entries = []
         trprps_by_ticker = {}
         in_rps_section = False
+        rps_pending_name = None
 
         trprps_mapping = {
             'VANGUARD INST EXT MKT IDX D': 'VIIIX',
             'VANGUARD INST 500 IDX TR D': 'VIEIX',
             'TRP STABLE VALUE COMM TR FD-N': 'Cash',
             'VANGUARD FTSE SOCIAL INDEX I': 'VFTNX',
+            'TRP US SMALL-CAP VALUE EQ TR-D': 'PRSVX',
+            'VANGUARD TTL INTL MKT IDX D': 'TRCEX',
         }
 
         with open(csv_path, 'r', newline='', encoding='utf-8-sig') as f:
@@ -116,19 +119,33 @@ class AssetProcessor:
                     continue
 
                 if in_rps_section:
-                    # Parse rows in the form: Investment Name$123,456.78
                     if len(row) < 1:
                         continue
 
                     # Amounts include commas and are unquoted in trow.csv, so csv.reader
                     # may split a single logical row into multiple columns.
                     line = ','.join(row).strip()
+
+                    # Format 1: alternating lines — fund name on one line, amount on next.
+                    # Format 2: single line in the form: Investment Name$123,456.78
                     if '$' not in line:
+                        # This is a fund name line; hold it for the next amount line.
+                        rps_pending_name = line
                         continue
 
-                    inv_name, amt_part = line.rsplit('$', 1)
-                    inv_name = inv_name.strip()
-                    amount = self._parse_currency_value(f'${amt_part.strip()}')
+                    # Line contains '$' — could be a standalone amount line or name$amount.
+                    if line.startswith('$') and rps_pending_name is not None:
+                        # Alternating format: amount line following a name line.
+                        inv_name = rps_pending_name
+                        amount = self._parse_currency_value(line)
+                        rps_pending_name = None
+                    else:
+                        # Single-line format: Investment Name$123,456.78
+                        rps_pending_name = None
+                        inv_name, amt_part = line.rsplit('$', 1)
+                        inv_name = inv_name.strip()
+                        amount = self._parse_currency_value(f'${amt_part.strip()}')
+
                     if amount is None or amount == 0:
                         continue
 
@@ -140,15 +157,15 @@ class AssetProcessor:
                     continue
 
                 # Skip the first section header row.
-                if len(row) >= 1 and row[0].lower() == 'account type':
+                if len(row) >= 1 and row[0].lower() == 'category':
                     continue
 
-                if len(row) < 9:
+                if len(row) < 10:
                     continue
 
-                account_type = row[0]
-                ticker = row[2]
-                market_value = self._parse_currency_value(row[8])
+                account_type = row[1]
+                ticker = row[3]
+                market_value = self._parse_currency_value(row[9])
 
                 account_prefix = account_mapping.get(account_type)
                 if not account_prefix:

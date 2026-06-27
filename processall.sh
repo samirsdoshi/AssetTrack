@@ -76,8 +76,8 @@ action=${1:-main}
 threshold=${2:-0.5}
 
 source ~/development/python/.venv/bin/activate
-currdate="2026-04-10"
-prevdate="2026-04-03"
+currdate="2026-06-19"
+prevdate="2026-06-12"
 
 ensure_docker_ready
 ensure_assets_container_running
