@@ -6,6 +6,8 @@ Uploads asset*.sql files and Asset.xlsx to specified Google Drive folder
 
 import os
 import glob
+import re
+from collections import defaultdict
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -18,6 +20,10 @@ SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
 # Google Drive folder ID
 FOLDER_ID = '1143-kZ1KCLy8yQsL8Dkms1mowIndLfRu'
+
+# Number of dated versions to keep per file type
+KEEP_VERSIONS = 3
+DATED_NAME = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})\.(sql|csv)$')
 
 
 def get_credentials():
@@ -117,6 +123,39 @@ def upload_file(service, file_path, folder_id):
         return None
 
 
+def prune_drive_backups(service, folder_id, keep=KEEP_VERSIONS):
+    """Trash all but the newest `keep` dated versions of each backup file type"""
+    groups = defaultdict(list)
+    page_token = None
+    try:
+        while True:
+            resp = service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields='nextPageToken, files(id, name)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            for f in resp.get('files', []):
+                m = DATED_NAME.match(f['name'])
+                if m:
+                    groups[(m.group(1), m.group(3))].append((m.group(2), f))
+            page_token = resp.get('nextPageToken')
+            if not page_token:
+                break
+    except Exception as e:
+        print(f"  Warning: Could not list Drive files for pruning: {e}")
+        return
+
+    for (prefix, ext), items in groups.items():
+        items.sort(key=lambda x: x[0], reverse=True)
+        for _, f in items[keep:]:
+            try:
+                service.files().update(fileId=f['id'], body={'trashed': True}).execute()
+                print(f"  Trashed old Drive backup: {f['name']}")
+            except Exception as e:
+                print(f"  Warning: Could not trash {f['name']}: {e}")
+
+
 def main():
     """Main function to upload backup files"""
     print("=" * 60)
@@ -174,6 +213,9 @@ def main():
             uploaded_count += 1
         print()
     
+    print(f"Pruning Drive backups (keeping last {KEEP_VERSIONS} of each)...")
+    prune_drive_backups(service, FOLDER_ID)
+
     print("=" * 60)
     print(f"Upload complete: {uploaded_count}/{len(files_to_upload)} files uploaded successfully")
     print("=" * 60)

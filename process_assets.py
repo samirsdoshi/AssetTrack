@@ -13,7 +13,48 @@ import csv
 from dotenv import load_dotenv
 import msoffcrypto
 import io
+import requests
 
+
+
+_YTD_CACHE = {}
+_NON_TICKERS = {'cash', 'stock', 'fcash', 'other', ''}
+
+
+def yahoo_ytd_gain(ticker, as_of):
+    """YTD total-return % for a ticker from Yahoo Finance, or None if not found.
+
+    Baseline is the last close on or before Dec 31 of the prior year; end is the
+    last close on or before as_of. Adjusted close is used so distributions count.
+    """
+    if ticker.strip().lower() in _NON_TICKERS:
+        return None
+    key = (ticker, as_of)
+    if key in _YTD_CACHE:
+        return _YTD_CACHE[key]
+    result = None
+    try:
+        start = datetime(as_of.year - 1, 12, 20)
+        end = datetime(as_of.year, as_of.month, as_of.day, 23, 59)
+        resp = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+            params={'period1': int(start.timestamp()), 'period2': int(end.timestamp()),
+                    'interval': '1d', 'events': 'history'},
+            headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        if resp.status_code == 200:
+            res = resp.json()['chart']['result'][0]
+            closes = res['indicators'].get('adjclose', [{}])[0].get('adjclose') \
+                or res['indicators']['quote'][0]['close']
+            rows = [(datetime.fromtimestamp(t).date(), c)
+                    for t, c in zip(res['timestamp'], closes) if c is not None]
+            base = [c for d, c in rows if d <= datetime(as_of.year - 1, 12, 31).date()]
+            cur = [c for d, c in rows if d <= as_of]
+            if base and cur and base[-1]:
+                result = (cur[-1] - base[-1]) / base[-1] * 100
+    except Exception:
+        result = None
+    _YTD_CACHE[key] = result
+    return result
 
 class AssetProcessor:
     """Main class to process Asset.xls file"""
@@ -379,7 +420,7 @@ class AssetProcessor:
             'Individual - TOD': 'FidelityInv',
             'Rollover IRA': 'FidelityIRA',
             'Samir S Doshi - Brokerage Account - 10498558': 'Vanguard',
-            'Samir S Doshi - Rollover IRA': 'Vanguard IRA'
+            'Samir S Doshi - Rollover IRA Brokerage Account - 85610549': 'Vanguard IRA'
         }
         
         account_data = {}  # Dictionary to store aggregated amounts by account
@@ -895,39 +936,44 @@ class AssetProcessor:
             print(f"Threshold: {threshold_percent}% change or more\n")
         
         self.db.open_db()
-        
+
         # Query to get asset values by account and ticker for both dates
-        query = """
-            SELECT 
+        query_dates = [datetocompare.strftime('%Y-%m-%d'), currdate.strftime('%Y-%m-%d')]
+        placeholders = ', '.join(['%s'] * len(query_dates))
+        query = f"""
+            SELECT
                 ai.asofdate,
                 ai.heldat as account,
                 a.ticker,
+                a.assetname,
                 SUM(aia.amount) as total_amount
             FROM assetinv ai
             JOIN assetinvalloc aia ON ai.assetinvid = aia.assetinvid
             JOIN asset a ON ai.assetid = a.assetid
-            WHERE ai.asofdate IN (%s, %s)
-            GROUP BY ai.asofdate, ai.heldat, a.ticker
+            WHERE ai.asofdate IN ({placeholders})
+            GROUP BY ai.asofdate, ai.heldat, a.ticker, a.assetname
             ORDER BY ai.heldat, a.ticker, ai.asofdate
         """
-        
-        results = self.db.execute_query(query, 
-            (datetocompare.strftime('%Y-%m-%d'), currdate.strftime('%Y-%m-%d')))
+
+        results = self.db.execute_query(query, tuple(query_dates))
         
         # Organize data by account_ticker and also track account totals
         data = {}
         account_totals = {}
         
+        fund_names = {}  # key -> assetname
         for row in results:
             date = row['asofdate']
             account = row['account']
             ticker = row['ticker']
             amount = float(row['total_amount'])
-            
+
             key = f"{account}_{ticker}"
             if key not in data:
                 data[key] = {}
             data[key][date] = amount
+            if key not in fund_names:
+                fund_names[key] = row['assetname'] or ''
             
             # Track account totals
             if account not in account_totals:
@@ -953,18 +999,24 @@ class AssetProcessor:
                     prev_amount = amount
                 if dk == curr_date:
                     curr_amount = amount
-            
+
             account_name = key.split('_')[0]  # Extract account name from key
-            
+            fund_name = fund_names.get(key, '')
+
+            # YTD gain from Yahoo price history for the ticker (None if unavailable)
+            yearly_pct = yahoo_ytd_gain(key.split('_', 1)[1], curr_date)
+
             if prev_amount == 0 and curr_amount > 0:
                 # New position
                 changes.append({
                     'key': key,
                     'account': account_name,
+                    'fund_name': fund_name,
                     'prev': prev_amount,
                     'curr': curr_amount,
                     'change': curr_amount,
                     'pct_change': 100.0,
+                    'yearly_pct': yearly_pct,
                     'type': 'NEW'
                 })
             elif prev_amount != 0 and curr_amount == 0:
@@ -972,26 +1024,30 @@ class AssetProcessor:
                 changes.append({
                     'key': key,
                     'account': account_name,
+                    'fund_name': fund_name,
                     'prev': prev_amount,
                     'curr': curr_amount,
                     'change': -prev_amount,
                     'pct_change': -100.0,
+                    'yearly_pct': yearly_pct,
                     'type': 'CLOSED'
                 })
             elif prev_amount != 0:
                 # Changed position (prev may be negative, e.g. margin balance)
                 change_amount = curr_amount - prev_amount
                 pct_change = (change_amount / abs(prev_amount)) * 100
-                
+
                 # Add to list if show_all or if above threshold
                 if show_all or abs(pct_change) >= threshold_percent:
                     changes.append({
                         'key': key,
                         'account': account_name,
+                        'fund_name': fund_name,
                         'prev': prev_amount,
                         'curr': curr_amount,
                         'change': change_amount,
                         'pct_change': pct_change,
+                        'yearly_pct': yearly_pct,
                         'type': 'CHANGE'
                     })
         
@@ -1056,42 +1112,45 @@ class AssetProcessor:
                     if current_account is not None:
                         summary = account_summary.get(current_account, {})
                         if summary:
-                            print(f"  {'-'*38} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+                            print(f"  {'-'*46} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
                             sprev = summary['prev']
                             scurr = summary['curr']
                             schange = summary['change']
                             spct = summary['pct_change']
-                            print(f"  {'TOTAL':<38} ${sprev:>10,.2f} ${scurr:>10,.2f} ${schange:>10,.2f} {spct:>9.2f}%")
+                            print(f"  {'TOTAL':<46} ${sprev:>10,.2f} ${scurr:>10,.2f} ${schange:>10,.2f} {spct:>9.2f}% {'':>10}")
                         print()  # Blank line between accounts
                     current_account = item['account']
                     print(f"\n{current_account}:")
-                    print(f"{'  Ticker':<38} {'Previous':>12} {'Current':>12} {'Change':>12} {'% Change':>10}")
-                    print(f"  {'-'*38} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
-                
+                    print(f"{'  Ticker':<10} {'Fund Name':<36} {'Previous':>12} {'Current':>12} {'Change':>12} {'% Change':>10} {'YTD Gain':>10}")
+                    print(f"  {'-'*8} {'-'*36} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
+
                 # Extract ticker from key (remove account prefix)
                 ticker = '_'.join(item['key'].split('_')[1:])
+                fund_name = item.get('fund_name', '')
                 prev = item['prev']
                 curr = item['curr']
                 change = item['change']
                 pct = item['pct_change']
-                
+                yearly_pct = item.get('yearly_pct')
+                yearly_str = f"{yearly_pct:>9.2f}%" if yearly_pct is not None else f"{'N/A':>10}"
+
                 if item['type'] == 'NEW':
-                    print(f"  {ticker:<38} {'NEW':>12} ${curr:>10,.2f} ${change:>10,.2f} {'NEW':>10}")
+                    print(f"  {ticker:<8} {fund_name:<36} {'NEW':>12} ${curr:>10,.2f} ${change:>10,.2f} {'NEW':>10} {yearly_str}")
                 elif item['type'] == 'CLOSED':
-                    print(f"  {ticker:<38} ${prev:>10,.2f} {'CLOSED':>12} ${change:>10,.2f} {'CLOSED':>10}")
+                    print(f"  {ticker:<8} {fund_name:<36} ${prev:>10,.2f} {'CLOSED':>12} ${change:>10,.2f} {'CLOSED':>10} {yearly_str}")
                 else:
-                    print(f"  {ticker:<38} ${prev:>10,.2f} ${curr:>10,.2f} ${change:>10,.2f} {pct:>9.2f}%")
+                    print(f"  {ticker:<8} {fund_name:<36} ${prev:>10,.2f} ${curr:>10,.2f} ${change:>10,.2f} {pct:>9.2f}% {yearly_str}")
                 
                 # Print summary line after the last item in the last account
                 if i == len(changes) - 1 and current_account is not None:
                     summary = account_summary.get(current_account, {})
                     if summary:
-                        print(f"  {'-'*38} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+                        print(f"  {'-'*38} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
                         sprev = summary['prev']
                         scurr = summary['curr']
                         schange = summary['change']
                         spct = summary['pct_change']
-                        print(f"  {'TOTAL':<38} ${sprev:>10,.2f} ${scurr:>10,.2f} ${schange:>10,.2f} {spct:>9.2f}%")
+                        print(f"  {'TOTAL':<38} ${sprev:>10,.2f} ${scurr:>10,.2f} ${schange:>10,.2f} {spct:>9.2f}% {'':>10}")
             
             print(f"\nTotal holdings shown: {len(changes)}")
         else:

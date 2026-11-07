@@ -51,6 +51,16 @@ ensure_assets_container_running() {
     echo "Docker container '${CONTAINER_NAME}' created and started."
 }
 
+prune_old_backups() {
+    local pattern="$1"
+    local keep=3
+
+    ls -1 backup/${pattern} 2>/dev/null | sort -r | tail -n +$((keep + 1)) | while read -r old_file; do
+        rm -f -- "$old_file"
+        echo "  Removed old backup: $old_file"
+    done
+}
+
 wait_for_mysql_ready() {
     local max_attempts=30
     local attempt=1
@@ -76,8 +86,8 @@ action=${1:-main}
 threshold=${2:-0.5}
 
 source ~/development/python/.venv/bin/activate
-currdate="2026-06-19"
-prevdate="2026-06-12"
+prevdate="2026-10-30"
+currdate="2026-11-06"
 
 ensure_docker_ready
 ensure_assets_container_running
@@ -88,8 +98,13 @@ if [ "$action" = "main" ]; then
     python process_assets.py --normalize --date "$currdate" --datetocompare "$prevdate"
     python process_assets.py --process --date "$currdate" --datetocompare "$prevdate"
     python process_assets.py --refresh-dataconn --currdate "$currdate" --datetocompare "$prevdate"
-    python process_assets.py --compare-dates --currdate "$currdate" --datetocompare "$prevdate" --threshold "$threshold" --show-all
+    python process_assets.py --compare-dates --currdate "$currdate" --datetocompare "$prevdate" --threshold "$threshold" --show-all > out.txt
 elif [ "$action" = "compare" ]; then
+    if [[ "${2:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "${3:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        prevdate="$2"
+        currdate="$3"
+        threshold="${4:-0.5}"
+    fi
     python process_assets.py --refresh-dataconn --currdate "$currdate" --datetocompare "$prevdate"
     python process_assets.py --compare-dates --currdate "$currdate" --datetocompare "$prevdate" --threshold "$threshold" --show-all > out.txt
 elif [ "$action" = "backup" ]; then
@@ -103,6 +118,13 @@ elif [ "$action" = "backup" ]; then
     [ -f "stocks.csv" ] && cp "stocks.csv" "backup/stocks_${currdate}.csv" && echo "  Backed up: stocks_${currdate}.csv"
     [ -f "allaccounts.csv" ] && cp "allaccounts.csv" "backup/allaccounts_${currdate}.csv" && echo "  Backed up: allaccounts_${currdate}.csv"
     
+    echo "Pruning old backups (keeping last 3 of each)..."
+    prune_old_backups "asset_*.sql"
+    prune_old_backups "Fidelity_*.csv"
+    prune_old_backups "trow_*.csv"
+    prune_old_backups "stocks_*.csv"
+    prune_old_backups "allaccounts_*.csv"
+
     echo "Uploading backups to Google Drive..."
     python upload_to_gdrive.py
 elif [ "$action" = "restore" ]; then
@@ -134,6 +156,8 @@ else
     echo "  $0 main"
     echo "  $0 main 0.5"
     echo "  $0 compare 0.5"
+  echo "  $0 compare 2026-07-03 2026-07-10"
+  echo "  $0 compare 2026-07-03 2026-07-10 0.5"
     echo "  $0 restore backup/asset_2026-02-27.sql"
     echo "  $0 show-dates"
     echo "  $0 show-dates 2026-01-01"
